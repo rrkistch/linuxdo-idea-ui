@@ -4186,9 +4186,85 @@ margin-left: auto; display: flex; gap: 2px;
 }
 
 .im-chat-tools .dot,
+    .im-composer-tools .dot {
+position: absolute; top: 6px; right: 6px; width: 6px; height: 6px;
+      background: var(--im-danger); border-radius: 50%;
+}
+
+.im-composer {
+background: var(--im-composer-bg, transparent); border-top: none;
+      padding: 4px 12px 12px; flex-shrink: 0;
+}
+
+.im-composer-card {
+background: #FFFFFF;
+      border: 1px solid var(--im-border);
+      border-radius: 12px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.im-composer-card:hover {
+border-color: #C2D4FF;
+      box-shadow: 0 2px 10px rgba(26,135,255,.08);
+}
+
+.im-composer-tools {
+display: flex; align-items: center; gap: 0; padding: 4px 10px 8px;
+}
+
+.im-composer-tools .spacer {
+flex: 1;
+}
+
+.im-send-btn {
+height: 26px; padding: 0 14px; border: 0; border-radius: 5px;
+      background: #C5C9D0; color: #fff; font-size: 12px; cursor: pointer;
+      font-family: var(--im-font);
+      transition: background 0.15s;
+}
+
+.im-send-btn:not(:disabled) {
+background: var(--im-accent);
+}
+
+.im-send-btn:disabled {
+cursor: not-allowed;
+}
+
+.im-chat-compose {
+position: relative;
+      z-index: 430;
+      flex-shrink: 0;
+      margin: 0;
+      min-height: 44px;
+      height: auto;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--im-text);
+      display: block;
+      padding: 8px 14px 10px;
+      font-size: 14px;
+      font-family: var(--im-font);
+      pointer-events: auto !important;
+      width: 100%;
+      text-align: left;
+      outline: none;
+      overflow-y: auto;
+      max-height: 160px;
+      cursor: text;
+      word-break: break-word;
+      white-space: pre-wrap;
+}
 
 /* contenteditable 占位符（容器有块级子元素，用 has-content 类控制）；
    绝对定位浮层：内联 ::before 会被块级子元素挤成独立一行 */
+.im-chat-compose:not(.has-content)::before {
+content: attr(data-placeholder);
+      position: absolute;
+      color: var(--im-text-4);
+      pointer-events: none;
+}
 
 /* 块级实时渲染：聚焦块显示原文，其余块渲染为富文本 */
 .im-md-block {
@@ -4339,6 +4415,25 @@ background: #1E222A;
 background: #2A3140;
 }
 
+.__ROOT_CLASS__.__DARK_CLASS__ .im-composer,
+    .__ROOT_CLASS__.__DARK_CLASS__ .im-composer-card {
+background: var(--im-composer-bg, var(--im-bg)) !important;
+      border-color: var(--im-border) !important;
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-composer-card:hover {
+border-color: #3B5F8A !important;
+      box-shadow: 0 2px 10px rgba(0,0,0,.35);
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-send-btn {
+background: #4A5160;
+      color: #fff;
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-send-btn:not(:disabled) {
+background: var(--im-accent);
+}
 
 .__ROOT_CLASS__.__DARK_CLASS__ .im-topic-chip {
 color: var(--im-accent);
@@ -8799,6 +8894,62 @@ ${pin.text || "无"}
     const nextState = getProfileFollowState();
     return { ok: true, following: nextState.following };
   }
+  function nativeCommentRoot() {
+    return document.getElementById("noteContainer") || document.querySelector(".note-container");
+  }
+  function nativeCommentInput(root) {
+    if (!root) return null;
+    return root.querySelector(
+      '.input-box [contenteditable="true"], .content-edit[contenteditable="true"], .input-box textarea, textarea.comment-input, .comment-input textarea, .input-box p[contenteditable]'
+    ) || [...root.querySelectorAll('[contenteditable="true"], textarea')].find((el) => el.closest(".input-box, .comment-input, .engage-bar, .interact-container"));
+  }
+  function nativeCommentSend(root, input) {
+    const box = (input == null ? void 0 : input.closest(".input-box, .comment-input, .comment-wrapper")) || root;
+    return (box == null ? void 0 : box.querySelector("button.submit, .submit, .right-btn-area button, button.send")) || [...(box == null ? void 0 : box.querySelectorAll("button")) || []].find((b) => /发送|发布/.test(b.textContent || ""));
+  }
+  function fillEditable(el, text) {
+    var _a;
+    el.focus({ preventScroll: true });
+    try {
+      document.execCommand("selectAll");
+    } catch {
+    }
+    if (document.execCommand("insertText", false, text)) return;
+    if ("value" in el) {
+      const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = (_a = Object.getOwnPropertyDescriptor(proto, "value")) == null ? void 0 : _a.set;
+      if (setter) setter.call(el, text);
+      else el.value = text;
+    } else {
+      el.textContent = text;
+    }
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+  }
+  async function postCommentViaNative(text) {
+    var _a;
+    const root = nativeCommentRoot();
+    if (!root) return false;
+    let input = nativeCommentInput(root);
+    if (!input) {
+      (_a = root.querySelector(".input-box, .comment-input, .engage-bar .chat-wrapper")) == null ? void 0 : _a.click();
+      await sleep(200);
+      input = nativeCommentInput(root);
+    }
+    if (!input) return false;
+    const prev = input.style.pointerEvents;
+    input.style.pointerEvents = "auto";
+    try {
+      fillEditable(input, text);
+      await sleep(80);
+      const send = nativeCommentSend(root, input);
+      if (!send) return false;
+      send.style.pointerEvents = "auto";
+      send.click();
+      return true;
+    } finally {
+      input.style.pointerEvents = prev;
+    }
+  }
   let activeImgModal = null;
   function openImImageModal(src, photos = []) {
     if (!src) return;
@@ -9382,8 +9533,15 @@ ${pin.text || "无"}
           <button type="button" class="im-icon-btn im-hide-media-toggle${isHideMedia() ? " is-on" : ""}" data-act="hide-media" title="${isHideMedia() ? "显示媒体（图片/视频）" : "隐藏媒体：纯文本摸鱼模式"}">${isHideMedia() ? ICONS.imageOff : ICONS.image}</button>
         </div>
       </div>
-      <div class="im-chat-body"><div class="im-feed-col"></div></div>`;
+      <div class="im-chat-body"><div class="im-feed-col"></div></div>
+      <div class="im-composer">
+        <div class="im-composer-card">
+          <div class="im-chat-compose" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="打开笔记后评论"></div>
+          <div class="im-composer-tools"><div class="spacer"></div><button type="button" class="im-send-btn" disabled>发送</button></div>
+        </div>
+      </div>`;
       (document.body || document.documentElement).appendChild(panel);
+      bindComposer(panel);
       (_a = panel.querySelector('[data-act="hide-media"]')) == null ? void 0 : _a.addEventListener("click", (e) => {
         e.stopPropagation();
         const on = !isHideMedia();
@@ -9428,9 +9586,89 @@ ${pin.text || "无"}
         if (h) navigateX("/" + h);
       });
     }
+    if (!panel.querySelector(".im-composer")) {
+      panel.insertAdjacentHTML("beforeend", `
+      <div class="im-composer">
+        <div class="im-composer-card">
+          <div class="im-chat-compose" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="打开笔记后评论"></div>
+          <div class="im-composer-tools"><div class="spacer"></div><button type="button" class="im-send-btn" disabled>发送</button></div>
+        </div>
+      </div>`);
+      bindComposer(panel);
+    }
     syncChatHeader(panel);
     syncChatMessages();
     return panel;
+  }
+  function composerText(box) {
+    return String((box == null ? void 0 : box.innerText) || "").replace(/ /g, " ").trim();
+  }
+  function syncComposeState(panel) {
+    const box = panel.querySelector(".im-chat-compose");
+    const send = panel.querySelector(".im-send-btn");
+    const has = !!composerText(box);
+    box == null ? void 0 : box.classList.toggle("has-content", has);
+    if (send) send.disabled = !has;
+  }
+  function syncComposerPlaceholder(panel) {
+    const box = (panel || document).querySelector(".im-chat-compose");
+    if (!box) return;
+    box.dataset.placeholder = (detailView == null ? void 0 : detailView.classList.contains("is-open")) ? "说点什么…" : "打开笔记后评论";
+  }
+  function bindComposer(panel) {
+    var _a;
+    if (!panel || panel.dataset.composeBound) return;
+    panel.dataset.composeBound = "1";
+    const box = panel.querySelector(".im-chat-compose");
+    const send = panel.querySelector(".im-send-btn");
+    (_a = panel.querySelector(".im-composer-card")) == null ? void 0 : _a.addEventListener("click", (e) => {
+      if (!e.target.closest(".im-send-btn")) box == null ? void 0 : box.focus();
+    });
+    box == null ? void 0 : box.addEventListener("click", (e) => e.stopPropagation());
+    box == null ? void 0 : box.addEventListener("input", () => syncComposeState(panel));
+    box == null ? void 0 : box.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        sendComposerText(panel);
+      }
+    });
+    send == null ? void 0 : send.addEventListener("click", (e) => {
+      e.stopPropagation();
+      sendComposerText(panel);
+    });
+  }
+  async function sendComposerText(panel) {
+    const box = panel.querySelector(".im-chat-compose");
+    const text = composerText(box);
+    if (!text) {
+      toast("请输入评论");
+      box == null ? void 0 : box.focus();
+      return;
+    }
+    if (!(detailView == null ? void 0 : detailView.classList.contains("is-open")) && !(lastThreadDetail == null ? void 0 : lastThreadDetail.id)) {
+      toast("先打开一篇笔记再评论");
+      return;
+    }
+    if (sendComposerText._busy) return;
+    sendComposerText._busy = true;
+    box == null ? void 0 : box.setAttribute("contenteditable", "false");
+    try {
+      const ok = await postCommentViaNative(text);
+      if (ok) {
+        toast("已发送");
+        box.innerText = "";
+        syncComposeState(panel);
+        const noteId = lastThreadDetail == null ? void 0 : lastThreadDetail.id;
+        if (noteId) {
+          window.setTimeout(() => applyCommentBatch(noteId, collectNoteComments(noteId)), 800);
+        }
+      } else {
+        toast("评论失败：原生输入框未就绪");
+      }
+    } finally {
+      box == null ? void 0 : box.setAttribute("contenteditable", "true");
+      sendComposerText._busy = false;
+    }
   }
   function syncChatHeader(panel) {
     var _a, _b, _c, _d, _e, _f, _g;
@@ -9450,6 +9688,7 @@ ${pin.text || "无"}
     }
     (_a = panel.querySelector(".im-chat-tabs")) == null ? void 0 : _a.remove();
     (_b = panel.querySelector(".im-channel-bar")) == null ? void 0 : _b.remove();
+    syncComposerPlaceholder(panel);
     if (routeKind() === "search") {
       const q = new URLSearchParams(location.search).get("q") || "";
       const name2 = `搜索: “${q}”`;
@@ -10682,6 +10921,7 @@ ${pin.text || "无"}
   let detailView = null;
   function setDetailOpen(open) {
     detailView == null ? void 0 : detailView.classList.toggle("is-open", open);
+    syncComposerPlaceholder();
   }
   function closeDetailTo() {
     const onNoteUrl = /\/explore\/[a-f0-9]+/.test(location.pathname);

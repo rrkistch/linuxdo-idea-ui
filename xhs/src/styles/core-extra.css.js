@@ -190,9 +190,85 @@ margin-left: auto; display: flex; gap: 2px;
 }
 
 .im-chat-tools .dot,
+    .im-composer-tools .dot {
+position: absolute; top: 6px; right: 6px; width: 6px; height: 6px;
+      background: var(--im-danger); border-radius: 50%;
+}
+
+.im-composer {
+background: var(--im-composer-bg, transparent); border-top: none;
+      padding: 4px 12px 12px; flex-shrink: 0;
+}
+
+.im-composer-card {
+background: #FFFFFF;
+      border: 1px solid var(--im-border);
+      border-radius: 12px;
+      transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.im-composer-card:hover {
+border-color: #C2D4FF;
+      box-shadow: 0 2px 10px rgba(26,135,255,.08);
+}
+
+.im-composer-tools {
+display: flex; align-items: center; gap: 0; padding: 4px 10px 8px;
+}
+
+.im-composer-tools .spacer {
+flex: 1;
+}
+
+.im-send-btn {
+height: 26px; padding: 0 14px; border: 0; border-radius: 5px;
+      background: #C5C9D0; color: #fff; font-size: 12px; cursor: pointer;
+      font-family: var(--im-font);
+      transition: background 0.15s;
+}
+
+.im-send-btn:not(:disabled) {
+background: var(--im-accent);
+}
+
+.im-send-btn:disabled {
+cursor: not-allowed;
+}
+
+.im-chat-compose {
+position: relative;
+      z-index: 430;
+      flex-shrink: 0;
+      margin: 0;
+      min-height: 44px;
+      height: auto;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: var(--im-text);
+      display: block;
+      padding: 8px 14px 10px;
+      font-size: 14px;
+      font-family: var(--im-font);
+      pointer-events: auto !important;
+      width: 100%;
+      text-align: left;
+      outline: none;
+      overflow-y: auto;
+      max-height: 160px;
+      cursor: text;
+      word-break: break-word;
+      white-space: pre-wrap;
+}
 
 /* contenteditable 占位符（容器有块级子元素，用 has-content 类控制）；
    绝对定位浮层：内联 ::before 会被块级子元素挤成独立一行 */
+.im-chat-compose:not(.has-content)::before {
+content: attr(data-placeholder);
+      position: absolute;
+      color: var(--im-text-4);
+      pointer-events: none;
+}
 
 /* 块级实时渲染：聚焦块显示原文，其余块渲染为富文本 */
 .im-md-block {
@@ -343,6 +419,25 @@ background: #1E222A;
 background: #2A3140;
 }
 
+.__ROOT_CLASS__.__DARK_CLASS__ .im-composer,
+    .__ROOT_CLASS__.__DARK_CLASS__ .im-composer-card {
+background: var(--im-composer-bg, var(--im-bg)) !important;
+      border-color: var(--im-border) !important;
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-composer-card:hover {
+border-color: #3B5F8A !important;
+      box-shadow: 0 2px 10px rgba(0,0,0,.35);
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-send-btn {
+background: #4A5160;
+      color: #fff;
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-send-btn:not(:disabled) {
+background: var(--im-accent);
+}
 
 .__ROOT_CLASS__.__DARK_CLASS__ .im-topic-chip {
 color: var(--im-accent);

@@ -11,6 +11,7 @@ import { chatIdFromRoute, routeKind } from "../bridge/router.js";
 import {
   toggleLike, toggleRetweet, toggleBookmark,
   toggleFollowOnProfile, getProfileFollowState,
+  postCommentViaNative,
 } from "../bridge/tweet.js";
 import {
   fetchTweetDetail, fetchSearchTimeline, posterVideoSrc,
@@ -197,8 +198,15 @@ export function ensureChatPanel() {
           <button type="button" class="im-icon-btn im-hide-media-toggle${isHideMedia() ? " is-on" : ""}" data-act="hide-media" title="${isHideMedia() ? "显示媒体（图片/视频）" : "隐藏媒体：纯文本摸鱼模式"}">${isHideMedia() ? ICONS.imageOff : ICONS.image}</button>
         </div>
       </div>
-      <div class="im-chat-body"><div class="im-feed-col"></div></div>`;
+      <div class="im-chat-body"><div class="im-feed-col"></div></div>
+      <div class="im-composer">
+        <div class="im-composer-card">
+          <div class="im-chat-compose" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="打开笔记后评论"></div>
+          <div class="im-composer-tools"><div class="spacer"></div><button type="button" class="im-send-btn" disabled>发送</button></div>
+        </div>
+      </div>`;
     (document.body || document.documentElement).appendChild(panel);
+    bindComposer(panel);
     panel.querySelector('[data-act="hide-media"]')?.addEventListener("click", (e) => {
       e.stopPropagation();
       const on = !isHideMedia();
@@ -242,9 +250,89 @@ export function ensureChatPanel() {
       if (h) navigateX("/" + h);
     });
   }
+  if (!panel.querySelector(".im-composer")) {
+    panel.insertAdjacentHTML("beforeend", `
+      <div class="im-composer">
+        <div class="im-composer-card">
+          <div class="im-chat-compose" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="打开笔记后评论"></div>
+          <div class="im-composer-tools"><div class="spacer"></div><button type="button" class="im-send-btn" disabled>发送</button></div>
+        </div>
+      </div>`);
+    bindComposer(panel);
+  }
   syncChatHeader(panel);
   syncChatMessages(panel);
   return panel;
+}
+
+function composerText(box) {
+  return String(box?.innerText || "").replace(/ /g, " ").trim();
+}
+
+function syncComposeState(panel) {
+  const box = panel.querySelector(".im-chat-compose");
+  const send = panel.querySelector(".im-send-btn");
+  const has = !!composerText(box);
+  box?.classList.toggle("has-content", has);
+  if (send) send.disabled = !has;
+}
+
+function syncComposerPlaceholder(panel) {
+  const box = (panel || document).querySelector(".im-chat-compose");
+  if (!box) return;
+  box.dataset.placeholder = detailView?.classList.contains("is-open") ? "说点什么…" : "打开笔记后评论";
+}
+
+function bindComposer(panel) {
+  if (!panel || panel.dataset.composeBound) return;
+  panel.dataset.composeBound = "1";
+  const box = panel.querySelector(".im-chat-compose");
+  const send = panel.querySelector(".im-send-btn");
+  panel.querySelector(".im-composer-card")?.addEventListener("click", (e) => {
+    if (!e.target.closest(".im-send-btn")) box?.focus();
+  });
+  box?.addEventListener("click", (e) => e.stopPropagation());
+  box?.addEventListener("input", () => syncComposeState(panel));
+  box?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      sendComposerText(panel);
+    }
+  });
+  send?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    sendComposerText(panel);
+  });
+}
+
+async function sendComposerText(panel) {
+  const box = panel.querySelector(".im-chat-compose");
+  const text = composerText(box);
+  if (!text) { toast("请输入评论"); box?.focus(); return; }
+  if (!detailView?.classList.contains("is-open") && !lastThreadDetail?.id) {
+    toast("先打开一篇笔记再评论");
+    return;
+  }
+  if (sendComposerText._busy) return;
+  sendComposerText._busy = true;
+  box?.setAttribute("contenteditable", "false");
+  try {
+    const ok = await postCommentViaNative(text);
+    if (ok) {
+      toast("已发送");
+      box.innerText = "";
+      syncComposeState(panel);
+      const noteId = lastThreadDetail?.id;
+      if (noteId) {
+        window.setTimeout(() => applyCommentBatch(noteId, collectNoteComments(noteId)), 800);
+      }
+    } else {
+      toast("评论失败：原生输入框未就绪");
+    }
+  } finally {
+    box?.setAttribute("contenteditable", "true");
+    sendComposerText._busy = false;
+  }
 }
 
 function syncChatHeader(panel) {
@@ -266,6 +354,7 @@ function syncChatHeader(panel) {
   // 保持纯粹 IM 聊天窗外观，彻底移除冗余的 chat-tabs 与 channel-bar
   panel.querySelector(".im-chat-tabs")?.remove();
   panel.querySelector(".im-channel-bar")?.remove();
+  syncComposerPlaceholder(panel);
 
   if (routeKind() === "search") {
     const q = new URLSearchParams(location.search).get("q") || "";
@@ -1621,6 +1710,7 @@ let detailView = null;
 /** 统一开合详情面板（100% 盖住列表） */
 function setDetailOpen(open) {
   detailView?.classList.toggle("is-open", open);
+  syncComposerPlaceholder();
 }
 
 /** 关闭详情面板：收起抽屉；若原生 overlay 被静默唤起（评论 DOM），用 popstate 关掉并还原 URL */

@@ -186,7 +186,9 @@ function buildItems(data) {
     const slug = typeof t === "string" ? t : (t.slug || t.name || t.id);
     if (!name) continue;
     const count = typeof t === "object" && t.topic_count > 0 ? `${t.topic_count} 话题` : "";
-    items.push({ group: "标签", title: `#${name}`, sub: count, href: `/tag/${encodeURIComponent(slug)}` });
+    // 非 ASCII 标签 slug 形如 `2234-tag`，裸 /tag/2234-tag 404，链接要带标签 ID
+    const m = typeof slug === "string" ? /^(\d+)-tag$/.exec(slug) : null;
+    items.push({ group: "标签", title: `#${name}`, sub: count, href: m ? `/tag/${slug}/${m[1]}` : `/tag/${encodeURIComponent(slug)}` });
   }
   return items;
 }

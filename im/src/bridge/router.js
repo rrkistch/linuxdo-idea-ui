@@ -65,8 +65,12 @@ export function listApiForPath(urlOrPath) {
   if (path === "/categories") return "/latest.json" + q("");
   const c = path.match(/^\/c\/([\w-]+(?:\/[\w-]+)?)/);
   if (c) return `/c/${c[1]}.json` + q("");
-  const t = path.match(/^\/tag\/([\w-]+)/);
-  if (t) return `/tag/${t[1]}.json` + q("");
+  const t = path.match(/^\/tag\/([\w-]+)(?:\/(\d+))?/);
+  if (t) {
+    // 中文等标签的 slug 形如 `2234-tag`，裸 /tag/2234-tag 会 404，必须带标签 ID
+    const id = t[2] || (/^(\d+)-tag$/.exec(t[1]) || [])[1];
+    return `/tag/${t[1]}${id ? `/${id}` : ""}.json` + q("");
+  }
   return "/latest.json" + q("");
 }
 

@@ -7720,8 +7720,11 @@ html.im-theme {
     if (path === "/categories") return "/latest.json" + q("");
     const c = path.match(/^\/c\/([\w-]+(?:\/[\w-]+)?)/);
     if (c) return `/c/${c[1]}.json` + q("");
-    const t = path.match(/^\/tag\/([\w-]+)/);
-    if (t) return `/tag/${t[1]}.json` + q("");
+    const t = path.match(/^\/tag\/([\w-]+)(?:\/(\d+))?/);
+    if (t) {
+      const id = t[2] || (/^(\d+)-tag$/.exec(t[1]) || [])[1];
+      return `/tag/${t[1]}${id ? `/${id}` : ""}.json` + q("");
+    }
     return "/latest.json" + q("");
   }
   function discourseRouteTo(url) {
@@ -12696,7 +12699,8 @@ ${data.raw}
       const slug = typeof t === "string" ? t : t.slug || t.name || t.id;
       if (!name) continue;
       const count = typeof t === "object" && t.topic_count > 0 ? `${t.topic_count} 话题` : "";
-      items.push({ group: "标签", title: `#${name}`, sub: count, href: `/tag/${encodeURIComponent(slug)}` });
+      const m = typeof slug === "string" ? /^(\d+)-tag$/.exec(slug) : null;
+      items.push({ group: "标签", title: `#${name}`, sub: count, href: m ? `/tag/${slug}/${m[1]}` : `/tag/${encodeURIComponent(slug)}` });
     }
     return items;
   }

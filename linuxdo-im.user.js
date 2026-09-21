@@ -2967,6 +2967,25 @@ display: inline-flex; align-items: center; gap: 2px;
 display: none;
 }
 
+/* 列表头左侧容器（筛选钮 + 搜索 + 排序下拉 + chips），右侧 actions 常驻 */
+.im-list-head-left {
+display: flex; align-items: center; gap: 6px; min-width: 0;
+      flex: 1;
+}
+
+/* 列表排序下拉：置于筛选行（.im-list-nav）末尾，随筛选行一起收起；选中写 URL order/ascending 重新拉取 */
+.im-list-sort {
+  height: 24px; padding: 0 8px; border: 1px solid #D3D8E2; border-radius: 12px;
+  background: var(--im-bg); color: var(--im-text-2); font-size: 12px;
+  font-family: var(--im-font); flex-shrink: 0; cursor: pointer; outline: none;
+  align-self: center; margin-left: auto;
+}
+.im-list-sort:hover { border-color: #B9C2D0; }
+/* 通知列/资料页等非会话源：排序无意义，隐藏 */
+.im-list-panel[data-rail-key]:not([data-rail-key="chat"]) .im-list-sort {
+  display: none;
+}
+
 /* /new（新）列表顶部「所有/话题/回复」筛选条（吸附原生 toggle）：
    独立一行挂在 header 下方；默认隐藏，非空内容（syncNewToggle）才显示 */
 .im-new-toggle {
@@ -3369,6 +3388,12 @@ background: #252B38;
 
 .__ROOT_CLASS__.__DARK_CLASS__ .im-list-chips {
 background: #1E222A;
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-list-sort {
+background: #1E222A;
+      border-color: #2A3140;
+      color: var(--im-text-2);
 }
 
 .__ROOT_CLASS__.__DARK_CLASS__ .im-chip-icon {
@@ -4843,6 +4868,23 @@ color: #7AA3D6;
     .im-search-more {
       cursor: pointer; min-width: 0; flex-shrink: 1;
       color: var(--im-accent); text-decoration: none;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    /* 高级指令下拉行（body 与 foot 之间）：5 个下拉横排，点选即追加指令进搜索框 */
+    .im-search-adv {
+      flex-shrink: 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      padding: 6px 20px 10px;
+    }
+    .im-search-adv-select {
+      height: 26px; padding: 0 8px; max-width: 120px;
+      border: 1px solid var(--im-border); border-radius: 13px;
+      background: var(--im-bg); color: var(--im-text-2);
+      font-size: 12px; font-family: var(--im-font);
+      cursor: pointer; outline: none; flex-shrink: 0;
+    }
+    .im-search-adv-select:hover { border-color: var(--im-accent); color: var(--im-text); }
+    .im-search-adv-hint {
+      margin-left: auto; font-size: 11px; color: var(--im-text-3);
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .__ROOT_CLASS__.__DARK_CLASS__ .im-search-pop { box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6); }
@@ -7639,6 +7681,15 @@ html.im-theme {
   function isHomePath(pathname) {
     return pathname === "/" || /^\/(latest|new|unread|unseen|top|categories|hot|posted|read|bookmarks)\b/.test(pathname) || /^\/c\//.test(pathname) || /^\/tag\//.test(pathname);
   }
+  function listSortQuery(search) {
+    const sp = new URLSearchParams(search);
+    const p = new URLSearchParams();
+    for (const k of ["order", "ascending"]) {
+      const v = sp.get(k);
+      if (v) p.set(k, v);
+    }
+    return p.toString();
+  }
   function listApiForPath(urlOrPath) {
     let path = urlOrPath || "";
     let search = "";
@@ -7648,40 +7699,30 @@ html.im-theme {
       path = path.slice(0, qIdx);
     }
     const searchParams = new URLSearchParams(search);
-    if (path === "/" || path === "/latest") {
-      const params = new URLSearchParams();
-      for (const k of ["order", "ascending"]) {
-        const v = searchParams.get(k);
-        if (v) params.set(k, v);
-      }
-      const qs = params.toString();
-      return qs ? `/latest.json?${qs}` : "/latest.json";
-    }
+    const sort = listSortQuery(search);
+    const q = (base) => {
+      const s = [base, sort].filter(Boolean).join("&");
+      return s ? `?${s}` : "";
+    };
+    if (path === "/" || path === "/latest") return "/latest.json" + q("");
     if (path === "/new") {
       const subset = searchParams.get("subset");
-      if (subset === "topics" || subset === "replies") {
-        return `/new.json?subset=${subset}`;
-      }
-      return "/new.json";
+      return "/new.json" + q(subset === "topics" || subset === "replies" ? `subset=${subset}` : "");
     }
-    if (path === "/unread" || path === "/unseen") return "/unseen.json";
-    if (path === "/top") {
-      const period = searchParams.get("period");
-      if (period) return `/top.json?period=${period}`;
-      return "/top.json";
-    }
+    if (path === "/unread" || path === "/unseen") return "/unseen.json" + q("");
+    if (path === "/top") return "/top.json" + q(searchParams.get("period") ? `period=${searchParams.get("period")}` : "");
     const top = path.match(/^\/top\/(weekly|monthly|quarterly|yearly|all)$/);
-    if (top) return `/top.json?period=${top[1]}`;
-    if (path === "/hot") return "/hot.json";
-    if (path === "/posted") return "/posted.json";
-    if (path === "/read") return "/read.json";
-    if (path === "/bookmarks") return "/bookmarks.json";
-    if (path === "/categories") return "/latest.json";
+    if (top) return "/top.json" + q(`period=${top[1]}`);
+    if (path === "/hot") return "/hot.json" + q("");
+    if (path === "/posted") return "/posted.json" + q("");
+    if (path === "/read") return "/read.json" + q("");
+    if (path === "/bookmarks") return "/bookmarks.json" + q("");
+    if (path === "/categories") return "/latest.json" + q("");
     const c = path.match(/^\/c\/([\w-]+(?:\/[\w-]+)?)/);
-    if (c) return `/c/${c[1]}.json`;
+    if (c) return `/c/${c[1]}.json` + q("");
     const t = path.match(/^\/tag\/([\w-]+)/);
-    if (t) return `/tag/${t[1]}.json`;
-    return "/latest.json";
+    if (t) return `/tag/${t[1]}.json` + q("");
+    return "/latest.json" + q("");
   }
   function discourseRouteTo(url) {
     var _a2, _b2;
@@ -12505,6 +12546,68 @@ ${data.raw}
     { key: "分类", label: "分类" },
     { key: "标签", label: "标签" }
   ];
+  const ADV_SELECTS = [
+    { ph: "排序", groups: [
+      { label: "按", items: [
+        ["order:likes", "点赞最多"],
+        ["order:latest", "最新回复"],
+        ["order:oldest", "最旧回复"],
+        ["order:views", "浏览最多"],
+        ["order:latest_topic", "最新主题"],
+        ["order:oldest_topic", "最旧主题"]
+      ] }
+    ] },
+    { ph: "范围", groups: [
+      { label: "搜索范围", items: [
+        ["in:title", "仅标题"],
+        ["in:first", "仅首帖"],
+        ["in:replies", "仅回复"],
+        ["in:all-posts", "全部帖子"],
+        ["in:wiki", "Wiki"],
+        ["in:pinned", "置顶"]
+      ] },
+      { label: "我的", items: [
+        ["in:likes", "我点赞的"],
+        ["in:bookmarks", "我收藏的"],
+        ["in:seen", "已读"],
+        ["in:unseen", "未读"]
+      ] }
+    ] },
+    { ph: "用户", groups: [
+      { label: "用户", items: [
+        ["@", "@用户名 提及"],
+        ["user:", "user: 发帖人"],
+        ["created:", "created: 创建者"],
+        ["group:", "group: 用户组"]
+      ] }
+    ] },
+    { ph: "分类/标签", groups: [
+      { label: "分类/标签", items: [
+        ["category:", "category: 分类"],
+        ["tags:", "tags: 标签"],
+        ["#", "#标签"],
+        ["-tags:", "-tags: 排除标签"]
+      ] }
+    ] },
+    { ph: "时间/状态", groups: [
+      { label: "时间", items: [
+        ["after:", "after: 此后"],
+        ["before:", "before: 此前"]
+      ] },
+      { label: "状态", items: [
+        ["status:open", "开放"],
+        ["status:closed", "已关闭"],
+        ["status:archived", "已归档"],
+        ["status:solved", "已解决"],
+        ["status:noreplies", "无回复"]
+      ] },
+      { label: "数值", items: [
+        ["min_posts:", "min_posts: 最少帖数"],
+        ["max_posts:", "max_posts: 最多帖数"],
+        ["min_views:", "min_views: 最少浏览"]
+      ] }
+    ] }
+  ];
   const CLOSE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
   const LINK_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4 4 0 0 0 5.66 0l3-3a4 4 0 1 0-5.66-5.66l-1.24 1.24"/><path d="M13.5 10.5a4 4 0 0 0-5.66 0l-3 3a4 4 0 1 0 5.66 5.66l1.24-1.24"/></svg>`;
   const state$1 = {
@@ -12659,6 +12762,7 @@ ${data.raw}
     if (moreEl) {
       moreEl.hidden = !term;
       moreEl.textContent = `在全文搜索中查看“${term}”的全部结果`;
+      moreEl.href = "/search?q=" + encodeURIComponent(term);
     }
   }
   async function runSearch(term) {
@@ -12692,6 +12796,17 @@ ${data.raw}
         renderBody();
       }
     }, DEBOUNCE_MS);
+  }
+  function appendToken(token) {
+    if (!token) return;
+    const isTemplate = token.length <= 2 || token.endsWith(":");
+    const cur = inputEl.value.trim();
+    if (!isTemplate && cur.split(/\s+/).includes(token)) return;
+    const next = cur ? `${cur} ${token}` : token;
+    inputEl.value = next;
+    state$1.term = next;
+    renderBody();
+    inputEl.focus();
   }
   function setActive(idx) {
     var _a2;
@@ -12730,6 +12845,16 @@ ${data.raw}
       </div>
       <div class="im-search-chips" role="group" aria-label="结果类型"></div>
       <div class="im-search-body" role="listbox" aria-label="搜索结果"></div>
+      <div class="im-search-adv" title="点选追加到搜索框，回车按指令全文搜索">
+        ${ADV_SELECTS.map((s, i) => `
+        <select class="im-search-adv-select" data-adv="${i}" aria-label="高级指令：${s.ph}">
+          <option value="" disabled selected>${s.ph}</option>
+          ${s.groups.map(
+      (g) => `<optgroup label="${g.label}">${g.items.map(([token, label]) => `<option value="${escapeHtml(token)}">${label}</option>`).join("")}</optgroup>`
+    ).join("")}
+        </select>`).join("")}
+        <span class="im-search-adv-hint">回车按指令搜索</span>
+      </div>
       <div class="im-search-foot">
         <a class="im-search-more" href="/search" hidden></a>
         <span class="im-search-tips">
@@ -12768,6 +12893,12 @@ ${data.raw}
       }
       renderBody();
     });
+    root.querySelector(".im-search-adv").addEventListener("change", (e) => {
+      const sel = e.target.closest(".im-search-adv-select");
+      if (!sel) return;
+      if (sel.value) appendToken(sel.value);
+      sel.selectedIndex = 0;
+    });
     inputEl.addEventListener("input", () => {
       state$1.term = inputEl.value;
       scheduleSearch();
@@ -12783,7 +12914,11 @@ ${data.raw}
         e.preventDefault();
         const term = state$1.term.trim();
         if (state$1.active >= 0 && state$1.flat[state$1.active]) openItem(state$1.flat[state$1.active]);
-        else if (term) runSearch(term);
+        else if (term) {
+          pushRecent(term);
+          closeSearchPopup();
+          navigateInApp(`/search?q=${encodeURIComponent(term)}`);
+        }
       }
     });
     bodyEl.addEventListener("click", (e) => {
@@ -13263,6 +13398,50 @@ ${data.raw}
     const active = location.pathname === "/" && /(?:^|&)order=created/.test(location.search);
     return [...items, { ...item, active }];
   }
+  const SORT_OPTIONS = [
+    ["", "默认排序"],
+    ["created|desc", "最新发布"],
+    ["created|asc", "最旧发布"],
+    ["likes|desc", "点赞最多"],
+    ["views|desc", "浏览最多"],
+    ["posts|desc", "回复最多"]
+  ];
+  function sortOptionsHtml() {
+    return SORT_OPTIONS.map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
+  }
+  function listSortFromUrl() {
+    const sp = new URLSearchParams(location.search);
+    const order = sp.get("order");
+    if (!order) return "";
+    const asc = sp.get("ascending") === "true";
+    return `${order}|${asc ? "asc" : "desc"}`;
+  }
+  function listSortSupported(path) {
+    return path === "/" || path === "/latest" || path === "/categories" || /^\/c\//.test(path) || /^\/tag\//.test(path);
+  }
+  function syncListSort(panel) {
+    const sel = panel.querySelector(".im-list-sort");
+    if (!sel) return;
+    if (!panel.dataset.sortBound) {
+      panel.dataset.sortBound = "1";
+      sel.addEventListener("change", () => {
+        const [order, asc] = sel.value.split("|");
+        const url = new URL(location.href);
+        if (order) {
+          url.searchParams.set("order", order);
+          url.searchParams.set("ascending", asc === "asc" ? "true" : "false");
+        } else {
+          url.searchParams.delete("order");
+          url.searchParams.delete("ascending");
+        }
+        history.replaceState({}, "", url.pathname + url.search);
+        loadList(listApiForPath(location.pathname + location.search), true);
+      });
+    }
+    const v = listSortFromUrl();
+    if (sel.value !== v) sel.value = v;
+    sel.hidden = !listSortSupported(location.pathname);
+  }
   function collectListNavItems() {
     const native = document.querySelector("#navigation-bar");
     if (native) {
@@ -13308,7 +13487,9 @@ ${data.raw}
     }
     if (nav.dataset.sig === html) return;
     nav.dataset.sig = html;
+    const sortSel = nav.querySelector(".im-list-sort");
     nav.innerHTML = html;
+    if (sortSel) nav.appendChild(sortSel);
   }
   function bindListPanelClicks(panel) {
     if (!panel || panel.dataset.linkBound === "2") return;
@@ -13399,6 +13580,7 @@ ${data.raw}
       ensureMaskTitleToggle(panel);
       ensureHighlightToggle(panel);
       applyListNavDom();
+      syncListSort(panel);
       syncNewToggle(panel, (targetApi) => loadList(targetApi || listApiForPath(location.pathname + location.search) || "/new.json", true));
       return panel;
     }
@@ -13407,11 +13589,13 @@ ${data.raw}
     const searchBox = SKIN_ID === "wecom" ? `<div class="im-list-search">${ICONS.search}<input type="search" placeholder="搜索" aria-label="搜索话题"></div>` : "";
     panel.innerHTML = `
     <div class="im-list-header">
-      <button type="button" class="im-chip-icon im-list-nav-toggle" title="筛选" aria-expanded="false">${ICONS.filter}</button>
-      ${searchBox}
-      <div class="im-list-chips">
-        <button type="button" class="im-chip active" data-chip="all">消息<span class="n"></span></button>
-        <button type="button" class="im-chip" data-chip="unread">未读<span class="n"></span></button>
+      <div class="im-list-head-left">
+        <button type="button" class="im-chip-icon im-list-nav-toggle" title="筛选" aria-expanded="false">${ICONS.filter}</button>
+        ${searchBox}
+        <div class="im-list-chips">
+          <button type="button" class="im-chip active" data-chip="all">消息<span class="n"></span></button>
+          <button type="button" class="im-chip" data-chip="unread">未读<span class="n"></span></button>
+        </div>
       </div>
       <div class="im-list-actions">
         <button type="button" class="im-icon-btn im-new-topic-btn" title="发帖（原生编辑器）">${ICONS.compose}</button>
@@ -13421,7 +13605,7 @@ ${data.raw}
       </div>
     </div>
     <div class="im-list-pins"></div>
-    <div class="im-list-nav" role="navigation" aria-label="话题筛选"></div>
+    <div class="im-list-nav" role="navigation" aria-label="话题筛选"><select class="im-list-sort" title="列表排序" aria-label="列表排序">${sortOptionsHtml()}</select></div>
     <div class="im-list-body"></div>
   `;
     document.body.appendChild(panel);
@@ -13435,6 +13619,7 @@ ${data.raw}
       onListBodyScroll(panel.querySelector(".im-list-body"));
     });
     applyListNavDom();
+    syncListSort(panel);
     syncNewToggle(panel, (targetApi) => loadList(targetApi || listApiForPath(location.pathname + location.search) || "/new.json", true));
     return panel;
   }

@@ -22,6 +22,16 @@ export function isHomePath(pathname) {
     /^\/(latest|new|unread|unseen|top|categories|hot|posted|read|bookmarks)\b/.test(pathname) ||
     /^\/c\//.test(pathname) || /^\/tag\//.test(pathname);
 }
+/** 列表排序参数（order/ascending）从当前 URL 提取，追加到列表端点 query */
+function listSortQuery(search) {
+  const sp = new URLSearchParams(search);
+  const p = new URLSearchParams();
+  for (const k of ["order", "ascending"]) {
+    const v = sp.get(k);
+    if (v) p.set(k, v);
+  }
+  return p.toString();
+}
 /** 中栏列表 JSON 端点按路由映射 */
 export function listApiForPath(urlOrPath) {
   let path = urlOrPath || "";
@@ -32,43 +42,32 @@ export function listApiForPath(urlOrPath) {
     path = path.slice(0, qIdx);
   }
   const searchParams = new URLSearchParams(search);
+  const sort = listSortQuery(search);
+  const q = (base) => {
+    const s = [base, sort].filter(Boolean).join("&");
+    return s ? `?${s}` : "";
+  };
 
-  if (path === "/" || path === "/latest") {
-    // 透传排序参数（如「最新话题」/?ascending=false&order=created），否则中栏仍按默认排序拉取
-    const params = new URLSearchParams();
-    for (const k of ["order", "ascending"]) {
-      const v = searchParams.get(k);
-      if (v) params.set(k, v);
-    }
-    const qs = params.toString();
-    return qs ? `/latest.json?${qs}` : "/latest.json";
-  }
+  if (path === "/" || path === "/latest") return "/latest.json" + q("");
   if (path === "/new") {
     const subset = searchParams.get("subset");
-    if (subset === "topics" || subset === "replies") {
-      return `/new.json?subset=${subset}`;
-    }
-    return "/new.json";
+    return "/new.json" + q(subset === "topics" || subset === "replies" ? `subset=${subset}` : "");
   }
-  if (path === "/unread" || path === "/unseen") return "/unseen.json";
-  if (path === "/top") {
-    const period = searchParams.get("period");
-    if (period) return `/top.json?period=${period}`;
-    return "/top.json";
-  }
+  if (path === "/unread" || path === "/unseen") return "/unseen.json" + q("");
+  if (path === "/top") return "/top.json" + q(searchParams.get("period") ? `period=${searchParams.get("period")}` : "");
   const top = path.match(/^\/top\/(weekly|monthly|quarterly|yearly|all)$/);
-  if (top) return `/top.json?period=${top[1]}`;
-  if (path === "/hot") return "/hot.json";
-  if (path === "/posted") return "/posted.json";
-  if (path === "/read") return "/read.json";
-  if (path === "/bookmarks") return "/bookmarks.json";
+  if (top) return "/top.json" + q(`period=${top[1]}`);
+  if (path === "/hot") return "/hot.json" + q("");
+  if (path === "/posted") return "/posted.json" + q("");
+  if (path === "/read") return "/read.json" + q("");
+  if (path === "/bookmarks") return "/bookmarks.json" + q("");
   // 类别页本身不是话题流；中栏仍拉 latest，避免 categories.json 无 topic_list
-  if (path === "/categories") return "/latest.json";
+  if (path === "/categories") return "/latest.json" + q("");
   const c = path.match(/^\/c\/([\w-]+(?:\/[\w-]+)?)/);
-  if (c) return `/c/${c[1]}.json`;
+  if (c) return `/c/${c[1]}.json` + q("");
   const t = path.match(/^\/tag\/([\w-]+)/);
-  if (t) return `/tag/${t[1]}.json`;
-  return "/latest.json";
+  if (t) return `/tag/${t[1]}.json` + q("");
+  return "/latest.json" + q("");
 }
 
 /** 站内软跳转：避免中栏自定义链接触发浏览器整页重载 */

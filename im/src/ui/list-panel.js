@@ -72,6 +72,54 @@ function withLatestCreated(items) {
   return [...items, { ...item, active }];
 }
 
+// —— 列表排序下拉：order/ascending 与 URL、列表加载双向同步（Discourse TopicList API 原生支持）——
+const SORT_OPTIONS = [
+  ["", "默认排序"],
+  ["created|desc", "最新发布"],
+  ["created|asc", "最旧发布"],
+  ["likes|desc", "点赞最多"],
+  ["views|desc", "浏览最多"],
+  ["posts|desc", "回复最多"],
+];
+function sortOptionsHtml() {
+  return SORT_OPTIONS.map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
+}
+function listSortFromUrl() {
+  const sp = new URLSearchParams(location.search);
+  const order = sp.get("order");
+  if (!order) return "";
+  const asc = sp.get("ascending") === "true";
+  return `${order}|${asc ? "asc" : "desc"}`;
+}
+// 排序仅在这些端点真实生效（latest 流及其变体）；其余筛选页端点不认 order，隐藏下拉
+function listSortSupported(path) {
+  return path === "/" || path === "/latest" || path === "/categories" ||
+    /^\/c\//.test(path) || /^\/tag\//.test(path);
+}
+function syncListSort(panel) {
+  const sel = panel.querySelector(".im-list-sort");
+  if (!sel) return;
+  if (!panel.dataset.sortBound) {
+    panel.dataset.sortBound = "1";
+    sel.addEventListener("change", () => {
+      const [order, asc] = sel.value.split("|");
+      const url = new URL(location.href);
+      if (order) {
+        url.searchParams.set("order", order);
+        url.searchParams.set("ascending", asc === "asc" ? "true" : "false");
+      } else {
+        url.searchParams.delete("order");
+        url.searchParams.delete("ascending");
+      }
+      history.replaceState({}, "", url.pathname + url.search);
+      loadList(listApiForPath(location.pathname + location.search), true);
+    });
+  }
+  const v = listSortFromUrl();
+  if (sel.value !== v) sel.value = v;
+  sel.hidden = !listSortSupported(location.pathname);
+}
+
 function collectListNavItems() {
   const native = document.querySelector("#navigation-bar");
   if (native) {
@@ -123,7 +171,9 @@ export function syncListNav() {
   }
     if (nav.dataset.sig === html) return; // 避免无变化时触发 MutationObserver 死循环
   nav.dataset.sig = html;
+  const sortSel = nav.querySelector(".im-list-sort"); // 重写前保存引用，重写后放回行尾
   nav.innerHTML = html;
+  if (sortSel) nav.appendChild(sortSel);
 }
 
 function bindListPanelClicks(panel) {
@@ -234,6 +284,7 @@ export function ensureListPanel() {
     ensureMaskTitleToggle(panel);
     ensureHighlightToggle(panel);
     applyListNavDom();
+    syncListSort(panel);
     syncNewToggle(panel, (targetApi) => loadList(targetApi || listApiForPath(location.pathname + location.search) || "/new.json", true));
     return panel;
   }
@@ -244,11 +295,13 @@ export function ensureListPanel() {
     : "";
   panel.innerHTML = `
     <div class="im-list-header">
-      <button type="button" class="im-chip-icon im-list-nav-toggle" title="筛选" aria-expanded="false">${ICONS.filter}</button>
-      ${searchBox}
-      <div class="im-list-chips">
-        <button type="button" class="im-chip active" data-chip="all">消息<span class="n"></span></button>
-        <button type="button" class="im-chip" data-chip="unread">未读<span class="n"></span></button>
+      <div class="im-list-head-left">
+        <button type="button" class="im-chip-icon im-list-nav-toggle" title="筛选" aria-expanded="false">${ICONS.filter}</button>
+        ${searchBox}
+        <div class="im-list-chips">
+          <button type="button" class="im-chip active" data-chip="all">消息<span class="n"></span></button>
+          <button type="button" class="im-chip" data-chip="unread">未读<span class="n"></span></button>
+        </div>
       </div>
       <div class="im-list-actions">
         <button type="button" class="im-icon-btn im-new-topic-btn" title="发帖（原生编辑器）">${ICONS.compose}</button>
@@ -258,7 +311,7 @@ export function ensureListPanel() {
       </div>
     </div>
     <div class="im-list-pins"></div>
-    <div class="im-list-nav" role="navigation" aria-label="话题筛选"></div>
+    <div class="im-list-nav" role="navigation" aria-label="话题筛选"><select class="im-list-sort" title="列表排序" aria-label="列表排序">${sortOptionsHtml()}</select></div>
     <div class="im-list-body"></div>
   `;
   document.body.appendChild(panel);
@@ -272,6 +325,7 @@ export function ensureListPanel() {
     onListBodyScroll(panel.querySelector(".im-list-body"));
   });
   applyListNavDom();
+  syncListSort(panel);
   syncNewToggle(panel, (targetApi) => loadList(targetApi || listApiForPath(location.pathname + location.search) || "/new.json", true));
   return panel;
 }

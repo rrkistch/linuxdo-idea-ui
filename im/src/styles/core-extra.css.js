@@ -62,6 +62,25 @@ display: inline-flex; align-items: center; gap: 2px;
 display: none;
 }
 
+/* 列表头左侧容器（筛选钮 + 搜索 + 排序下拉 + chips），右侧 actions 常驻 */
+.im-list-head-left {
+display: flex; align-items: center; gap: 6px; min-width: 0;
+      flex: 1;
+}
+
+/* 列表排序下拉：置于筛选行（.im-list-nav）末尾，随筛选行一起收起；选中写 URL order/ascending 重新拉取 */
+.im-list-sort {
+  height: 24px; padding: 0 8px; border: 1px solid #D3D8E2; border-radius: 12px;
+  background: var(--im-bg); color: var(--im-text-2); font-size: 12px;
+  font-family: var(--im-font); flex-shrink: 0; cursor: pointer; outline: none;
+  align-self: center; margin-left: auto;
+}
+.im-list-sort:hover { border-color: #B9C2D0; }
+/* 通知列/资料页等非会话源：排序无意义，隐藏 */
+.im-list-panel[data-rail-key]:not([data-rail-key="chat"]) .im-list-sort {
+  display: none;
+}
+
 /* /new（新）列表顶部「所有/话题/回复」筛选条（吸附原生 toggle）：
    独立一行挂在 header 下方；默认隐藏，非空内容（syncNewToggle）才显示 */
 .im-new-toggle {
@@ -464,6 +483,12 @@ background: #252B38;
 
 .__ROOT_CLASS__.__DARK_CLASS__ .im-list-chips {
 background: #1E222A;
+}
+
+.__ROOT_CLASS__.__DARK_CLASS__ .im-list-sort {
+background: #1E222A;
+      border-color: #2A3140;
+      color: var(--im-text-2);
 }
 
 .__ROOT_CLASS__.__DARK_CLASS__ .im-chip-icon {
@@ -1938,6 +1963,23 @@ color: #7AA3D6;
     .im-search-more {
       cursor: pointer; min-width: 0; flex-shrink: 1;
       color: var(--im-accent); text-decoration: none;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    /* 高级指令下拉行（body 与 foot 之间）：5 个下拉横排，点选即追加指令进搜索框 */
+    .im-search-adv {
+      flex-shrink: 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      padding: 6px 20px 10px;
+    }
+    .im-search-adv-select {
+      height: 26px; padding: 0 8px; max-width: 120px;
+      border: 1px solid var(--im-border); border-radius: 13px;
+      background: var(--im-bg); color: var(--im-text-2);
+      font-size: 12px; font-family: var(--im-font);
+      cursor: pointer; outline: none; flex-shrink: 0;
+    }
+    .im-search-adv-select:hover { border-color: var(--im-accent); color: var(--im-text); }
+    .im-search-adv-hint {
+      margin-left: auto; font-size: 11px; color: var(--im-text-3);
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .__ROOT_CLASS__.__DARK_CLASS__ .im-search-pop { box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6); }

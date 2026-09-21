@@ -31,6 +31,71 @@ const TYPES = [
   { key: "标签", label: "标签" }
 ];
 
+// 高级指令：5 个下拉，点选即把指令追加进搜索框，回车/更多链接带全部指令跳 /search?q=
+// token 是追加的原始指令；以 ":" 结尾或 ≤2 字符的是模板（需补参数，如 user:、@），不参与去重
+const ADV_SELECTS = [
+  { ph: "排序", groups: [
+    { label: "按", items: [
+      ["order:likes", "点赞最多"],
+      ["order:latest", "最新回复"],
+      ["order:oldest", "最旧回复"],
+      ["order:views", "浏览最多"],
+      ["order:latest_topic", "最新主题"],
+      ["order:oldest_topic", "最旧主题"]
+    ]}
+  ]},
+  { ph: "范围", groups: [
+    { label: "搜索范围", items: [
+      ["in:title", "仅标题"],
+      ["in:first", "仅首帖"],
+      ["in:replies", "仅回复"],
+      ["in:all-posts", "全部帖子"],
+      ["in:wiki", "Wiki"],
+      ["in:pinned", "置顶"]
+    ]},
+    { label: "我的", items: [
+      ["in:likes", "我点赞的"],
+      ["in:bookmarks", "我收藏的"],
+      ["in:seen", "已读"],
+      ["in:unseen", "未读"]
+    ]}
+  ]},
+  { ph: "用户", groups: [
+    { label: "用户", items: [
+      ["@", "@用户名 提及"],
+      ["user:", "user: 发帖人"],
+      ["created:", "created: 创建者"],
+      ["group:", "group: 用户组"]
+    ]}
+  ]},
+  { ph: "分类/标签", groups: [
+    { label: "分类/标签", items: [
+      ["category:", "category: 分类"],
+      ["tags:", "tags: 标签"],
+      ["#", "#标签"],
+      ["-tags:", "-tags: 排除标签"]
+    ]}
+  ]},
+  { ph: "时间/状态", groups: [
+    { label: "时间", items: [
+      ["after:", "after: 此后"],
+      ["before:", "before: 此前"]
+    ]},
+    { label: "状态", items: [
+      ["status:open", "开放"],
+      ["status:closed", "已关闭"],
+      ["status:archived", "已归档"],
+      ["status:solved", "已解决"],
+      ["status:noreplies", "无回复"]
+    ]},
+    { label: "数值", items: [
+      ["min_posts:", "min_posts: 最少帖数"],
+      ["max_posts:", "max_posts: 最多帖数"],
+      ["min_views:", "min_views: 最少浏览"]
+    ]}
+  ]}
+];
+
 const CLOSE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>`;
 const LINK_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 13.5a4 4 0 0 0 5.66 0l3-3a4 4 0 1 0-5.66-5.66l-1.24 1.24"/><path d="M13.5 10.5a4 4 0 0 0-5.66 0l-3 3a4 4 0 1 0 5.66 5.66l1.24-1.24"/></svg>`;
 
@@ -198,6 +263,7 @@ function renderBody() {
   if (moreEl) {
     moreEl.hidden = !term;
     moreEl.textContent = `在全文搜索中查看“${term}”的全部结果`;
+    moreEl.href = "/search?q=" + encodeURIComponent(term);
   }
 }
 
@@ -231,6 +297,19 @@ function scheduleSearch() {
     if (term) runSearch(term);
     else { state.seq++; state.loading = false; state.error = null; renderBody(); }
   }, DEBOUNCE_MS);
+}
+
+/** 指令面板点选：追加 token 到搜索框；模板指令（@、user: 等需补参数）不去重，完整指令精确去重 */
+function appendToken(token) {
+  if (!token) return;
+  const isTemplate = token.length <= 2 || token.endsWith(":");
+  const cur = inputEl.value.trim();
+  if (!isTemplate && cur.split(/\s+/).includes(token)) return;
+  const next = cur ? `${cur} ${token}` : token;
+  inputEl.value = next;
+  state.term = next;
+  renderBody();
+  inputEl.focus();
 }
 
 function setActive(idx) {
@@ -271,6 +350,18 @@ function ensureRoot() {
       </div>
       <div class="im-search-chips" role="group" aria-label="结果类型"></div>
       <div class="im-search-body" role="listbox" aria-label="搜索结果"></div>
+      <div class="im-search-adv" title="点选追加到搜索框，回车按指令全文搜索">
+        ${ADV_SELECTS.map((s, i) => `
+        <select class="im-search-adv-select" data-adv="${i}" aria-label="高级指令：${s.ph}">
+          <option value="" disabled selected>${s.ph}</option>
+          ${s.groups.map((g) =>
+            `<optgroup label="${g.label}">${
+              g.items.map(([token, label]) => `<option value="${escapeHtml(token)}">${label}</option>`).join("")
+            }</optgroup>`
+          ).join("")}
+        </select>`).join("")}
+        <span class="im-search-adv-hint">回车按指令搜索</span>
+      </div>
       <div class="im-search-foot">
         <a class="im-search-more" href="/search" hidden></a>
         <span class="im-search-tips">
@@ -311,6 +402,12 @@ function ensureRoot() {
     }
     renderBody();
   });
+  root.querySelector(".im-search-adv").addEventListener("change", (e) => {
+    const sel = e.target.closest(".im-search-adv-select");
+    if (!sel) return;
+    if (sel.value) appendToken(sel.value);
+    sel.selectedIndex = 0; // 回位占项，允许多次追加
+  });
 
   inputEl.addEventListener("input", () => {
     state.term = inputEl.value;
@@ -323,7 +420,12 @@ function ensureRoot() {
       e.preventDefault();
       const term = state.term.trim();
       if (state.active >= 0 && state.flat[state.active]) openItem(state.flat[state.active]);
-      else if (term) runSearch(term);
+      else if (term) {
+        // 无选中项：带全部指令进完整搜索页（Discourse /search?q= 原生解析）
+        pushRecent(term);
+        closeSearchPopup();
+        navigateInApp(`/search?q=${encodeURIComponent(term)}`);
+      }
     }
   });
   // 点击结果：委托 + SPA 软跳转（含 recent 关键词）；复制链接按钮拦截

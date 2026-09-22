@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Linux DO · Codex 外观
 // @namespace    https://linux.do/
-// @version      0.2.0
+// @version      0.3.0
 // @description  将 Linux DO 换成 Codex 桌面 app 风格（配色实测自原版，明暗双模式）。仅改变外观，保留站点原有内容与交互。
 // @author       czm15053
 // @match        https://linux.do/*
@@ -130,10 +130,11 @@
     return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
   }
 
-  async function api(path, extraHeaders) {
+  async function api(path, extraHeaders, signal) {
     const resp = await fetch(path, {
       headers: { Accept: "application/json", ...extraHeaders },
-      credentials: "same-origin"
+      credentials: "same-origin",
+      signal: signal || undefined
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     return resp.json();
@@ -195,9 +196,211 @@
     return false;
   }
 
+  /* ============================== 页面外壳、请求版本与生命周期 ============================== */
+
+  let isThemeActiveState = false;
+  function isThemeActive() {
+    return isThemeActiveState;
+  }
+
+  let originalDocumentTitle = "";
+  let originalFaviconHref = "";
+
+  function saveOriginalChrome() {
+    if (typeof document === "undefined") return;
+    if (!originalDocumentTitle) originalDocumentTitle = document.title || "Linux DO";
+    if (!originalFaviconHref) {
+      const link = document.querySelector("link[rel*='icon']");
+      originalFaviconHref = link ? link.getAttribute("href") : "https://linux.do/favicon.ico";
+    }
+  }
+
+  function restoreOriginalChrome() {
+    if (typeof document === "undefined") return;
+    if (originalDocumentTitle) {
+      document.title = originalDocumentTitle;
+    }
+    if (originalFaviconHref) {
+      const icons = document.querySelectorAll("link[rel*='icon']");
+      icons.forEach((ic) => ic.setAttribute("href", originalFaviconHref));
+      document.getElementById(FAVICON_ID)?.remove();
+      document.querySelector("link[data-codex-shortcut='1']")?.remove();
+    }
+  }
+
+  /** 构造原生界面 URL，携带 cx_native=1 单页标记并完整保留 query 和 hash */
+  function buildNativeUrl(rawHref) {
+    try {
+      const baseOrigin = typeof location !== "undefined" ? location.origin : "https://linux.do";
+      const url = new URL(rawHref || (typeof location !== "undefined" ? location.href : ""), baseOrigin);
+      url.searchParams.set("cx_native", "1");
+      return url.toString();
+    } catch {
+      const base = rawHref || (typeof location !== "undefined" ? location.href : "");
+      return base.includes("?") ? `${base}&cx_native=1` : `${base}?cx_native=1`;
+    }
+  }
+
+  /**
+   * 原生模式、CF 盾、互斥等旁路检测
+   * 支持传入 env 用于单元测试：{ search, sessionStorage }
+   */
+  function shouldBypassTheme(env) {
+    const search = env ? env.search : (typeof location !== "undefined" ? location.search : "");
+    const session = env ? env.sessionStorage : (typeof sessionStorage !== "undefined" ? sessionStorage : null);
+
+    if (!env && cfBlocked()) return true;
+    if (!env && otherThemeActive()) return true;
+
+    try {
+      if (search) {
+        const sp = new URLSearchParams(search);
+        if (sp.get("cx_native") === "1") {
+          try { session?.setItem?.("codex_native_mode", "1"); } catch { /* ignore */ }
+          return true;
+        }
+      }
+      if (session?.getItem?.("codex_native_mode") === "1") {
+        return true;
+      }
+    } catch { /* ignore */ }
+    return false;
+  }
+
+  /** 原生模式下渲染非侵入式的“恢复 Codex 外观”轻量按钮 */
+  function renderNativeBypassBar() {
+    if (typeof document === "undefined") return;
+    if (document.getElementById("codex-native-restore-btn")) return;
+    const btn = document.createElement("button");
+    btn.id = "codex-native-restore-btn";
+    btn.textContent = "恢复 Codex 外观";
+    btn.setAttribute(
+      "style",
+      "position:fixed;bottom:18px;right:18px;z-index:99999;padding:7px 14px;background:#10a37f;color:#ffffff;border:none;border-radius:6px;font-size:12px;font-family:var(--cx-font-ui, sans-serif);font-weight:500;cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,0.25);transition:opacity 0.15s;"
+    );
+    btn.addEventListener("click", () => {
+      try { sessionStorage.removeItem("codex_native_mode"); } catch { /* ignore */ }
+      try {
+        const url = new URL(location.href);
+        url.searchParams.delete("cx_native");
+        history.replaceState(null, "", url.toString());
+      } catch { /* ignore */ }
+      btn.remove();
+      applyTheme();
+    });
+    (document.body || document.documentElement).appendChild(btn);
+  }
+
+  /**
+   * 请求版本协调器：处理 A→B 竞态、A→B→A 乱序返回、同页失败重试及请求取消
+   */
+  class RequestCoordinator {
+    constructor(domainName) {
+      this.domain = domainName;
+      this.currentRequestId = 0;
+      this.activeKey = null;
+      this.loadedKey = null;
+      this.status = "idle"; // "idle" | "loading" | "ready" | "error"
+      this.controller = null;
+      this.lastError = null;
+    }
+
+    begin(key) {
+      this.currentRequestId++;
+      const reqId = this.currentRequestId;
+      this.activeKey = key;
+      this.status = "loading";
+      this.lastError = null;
+      if (this.controller) {
+        try { this.controller.abort(); } catch { /* ignore */ }
+      }
+      if (typeof AbortController !== "undefined") {
+        this.controller = new AbortController();
+      } else {
+        this.controller = null;
+      }
+      return {
+        requestId: reqId,
+        key,
+        signal: this.controller ? this.controller.signal : null,
+        isCurrent: () => reqId === this.currentRequestId && this.activeKey === key
+      };
+    }
+
+    succeed(reqId, key) {
+      if (reqId === this.currentRequestId && this.activeKey === key) {
+        this.loadedKey = key;
+        this.status = "ready";
+        this.lastError = null;
+        return true;
+      }
+      return false;
+    }
+
+    fail(reqId, key, error) {
+      if (reqId === this.currentRequestId && this.activeKey === key) {
+        this.status = "error";
+        this.lastError = error;
+        return true;
+      }
+      return false;
+    }
+
+    isCurrent(reqId, key) {
+      return reqId === this.currentRequestId && (!key || this.activeKey === key);
+    }
+  }
+
+  const topicCoordinator = new RequestCoordinator("topic");
+  const listCoordinator = new RequestCoordinator("list");
+
+  /** 统一外壳同步：集中管理标题、favicon、面包屑与活动状态 */
+  function syncAppChrome(options) {
+    if (typeof document === "undefined") return;
+    saveOriginalChrome();
+    if (!isThemeActive()) return;
+
+    const opt = options || {};
+    let pageTitle = opt.title;
+    if (!pageTitle) {
+      if (isTopicPath(location.pathname) && threadState.title) {
+        pageTitle = threadState.title;
+      } else {
+        pageTitle = listTitleForPath(location.pathname) || "Codex";
+      }
+    }
+
+    const brandSuffix = " · Codex";
+    const nextTitle = `${pageTitle}${brandSuffix}`;
+    if (document.title !== nextTitle) {
+      document.title = nextTitle;
+    }
+    makeFavicon();
+  }
+
+  /**
+   * 彻底清理本脚本创建的资源：class、样式、浮层、并阻止旧异步请求复活 UI
+   */
+  function teardownTheme() {
+    isThemeActiveState = false;
+    if (typeof document !== "undefined") {
+      document.documentElement?.classList.remove(
+        ROOT_CLASS, LOCK_CLASS, "codex-topic-open", "codex-rail-open", "codex-rail-collapsed"
+      );
+      document.getElementById(STYLE_ID)?.remove();
+      document.querySelector(".codex-main")?.remove();
+      document.querySelector(".codex-rail")?.remove();
+      closeLightbox();
+      closeNotifMenu();
+      restoreOriginalChrome();
+    }
+  }
+
   /* ============================== 图片灯箱（移植自 terminal 皮肤 35bd821，改 Codex 配色） ============================== */
 
   let activeLightbox = null;
+  let lbMouseMoveHandler = null;
+  let lbMouseUpHandler = null;
 
   function lightboxKeydown(e) {
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeLightbox(); }
@@ -208,6 +411,14 @@
       activeLightbox.remove();
       activeLightbox = null;
       document.removeEventListener("keydown", lightboxKeydown, true);
+    }
+    if (lbMouseMoveHandler) {
+      window.removeEventListener("mousemove", lbMouseMoveHandler);
+      lbMouseMoveHandler = null;
+    }
+    if (lbMouseUpHandler) {
+      window.removeEventListener("mouseup", lbMouseUpHandler);
+      lbMouseUpHandler = null;
     }
   }
 
@@ -245,11 +456,13 @@
       e.preventDefault();
       dragging = true; sx = e.clientX - tx; sy = e.clientY - ty;
     });
-    window.addEventListener("mousemove", (e) => {
+    lbMouseMoveHandler = (e) => {
       if (!dragging) return;
       tx = e.clientX - sx; ty = e.clientY - sy; apply(false);
-    });
-    window.addEventListener("mouseup", () => { dragging = false; });
+    };
+    lbMouseUpHandler = () => { dragging = false; };
+    window.addEventListener("mousemove", lbMouseMoveHandler);
+    window.addEventListener("mouseup", lbMouseUpHandler);
     img.addEventListener("dblclick", () => {
       if (scale > 1.1) { scale = 1; tx = 0; ty = 0; }
       else scale = 2;
@@ -2060,21 +2273,129 @@
     .cx-turn-user-bubble p:last-child { margin-bottom: 0; }
     .cx-turn-user-bubble img:not(.emoji),
     .cx-turn-agent img:not(.emoji) {
-      max-width: 180px;
-      max-height: 110px;
+      max-width: 220px;
+      max-height: 140px;
       object-fit: contain;
       border-radius: 8px;
       cursor: zoom-in;
-      transition: max-width 0.2s ease, max-height 0.2s ease;
+      transition: opacity 0.15s ease, box-shadow 0.15s ease;
     }
     .cx-turn-user-bubble img:not(.emoji):hover,
     .cx-turn-agent img:not(.emoji):hover {
-      /* 防出屏：放大受宽度/高度双重钳制，永不超出可视区（移植自 terminal 皮肤 35bd821） */
-      max-width: min(680px, 84vw);
-      max-height: min(62vh, 560px);
-      cursor: zoom-out;
+      /* 固定尺寸，不再改变正文占位，hover 仅提示可点击放大进入灯箱 */
+      box-shadow: 0 0 0 2px var(--cx-brand, #10a37f);
+      opacity: 0.92;
     }
     .cx-turn-agent img.emoji, .cx-turn-user-bubble img.emoji { max-width: 100%; border-radius: 0; }
+
+    /* 宽屏侧栏折叠 */
+    @media (min-width: 1025px) {
+      html.codex-rail-collapsed .codex-rail {
+        width: 52px !important;
+        overflow: hidden;
+      }
+      html.codex-rail-collapsed .codex-rail-brand,
+      html.codex-rail-collapsed .cx-label,
+      html.codex-rail-collapsed .codex-rail-dynamic,
+      html.codex-rail-collapsed .cx-resizer,
+      html.codex-rail-collapsed .codex-rail-foot-user {
+        display: none !important;
+      }
+      html.codex-rail-collapsed .codex-rail-traffic {
+        justify-content: center;
+        padding: 10px 0;
+      }
+      html.codex-rail-collapsed .cx-nav-back,
+      html.codex-rail-collapsed .cx-nav-forward {
+        display: none !important;
+      }
+      html.codex-rail-collapsed .codex-rail-foot {
+        padding: 10px 0;
+        justify-content: center;
+      }
+      html.codex-rail-collapsed .codex-rail-item {
+        justify-content: center;
+        padding: 9px 0;
+      }
+      html.codex-rail-collapsed .codex-main {
+        left: 52px !important;
+      }
+    }
+
+    .cx-traffic-btn {
+      background: none;
+      border: none;
+      padding: 3px;
+      margin: 0;
+      color: inherit;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      transition: background 0.15s ease;
+    }
+    .cx-traffic-btn:hover {
+      background: var(--cx-wash, rgba(255,255,255,0.06));
+    }
+
+    .cx-meta-subtle {
+      font-size: 11.5px;
+      color: var(--cx-text-dim);
+      opacity: 0.85;
+      transition: opacity 0.15s ease;
+    }
+    .cx-turn-user:hover + .cx-meta-subtle,
+    .cx-meta-subtle:hover,
+    .cx-turn-agent:hover + .cx-worked {
+      opacity: 1;
+    }
+
+    .cx-open-in-panel {
+      font-size: 11px;
+      color: var(--cx-text-dim);
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 4px;
+      border: 1px solid var(--cx-border-soft);
+      margin-left: 6px;
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+    }
+    .cx-open-in-panel:hover {
+      color: var(--cx-text);
+      background: var(--cx-wash);
+      border-color: var(--cx-border-hard);
+    }
+    .cx-open-in-panel svg { width: 12px; height: 12px; }
+
+    .cx-code-empty-state {
+      padding: 40px 20px;
+      text-align: center;
+      color: var(--cx-text-dim);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .cx-btn-action-sm {
+      background: none;
+      border: 1px solid var(--cx-border-soft);
+      border-radius: 4px;
+      color: var(--cx-text-dim);
+      font-size: 11px;
+      padding: 3px 8px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      transition: all 0.15s ease;
+    }
+    .cx-btn-action-sm:hover {
+      color: var(--cx-text);
+      border-color: var(--cx-border-hard);
+      background: var(--cx-wash);
+    }
+
 
     /* ---------- 图片灯箱：点击 [img] 完整显示原图（移植自 terminal 皮肤 35bd821） ---------- */
     .cx-lightbox {
@@ -3754,47 +4075,78 @@
 
   /* ============================== 左 rail ============================== */
 
+  const CATEGORY_ALIASES_KEY = "linuxdo-codex-cat-aliases";
+  function getCategoryAliases() {
+    try {
+      return JSON.parse(localStorage.getItem(CATEGORY_ALIASES_KEY) || "{}");
+    } catch { return {}; }
+  }
+  function getCategoryDisplayName(cat, aliases) {
+    if (!cat) return "";
+    const map = aliases || getCategoryAliases();
+    return map[String(cat.id)] || map[cat.slug] || cat.name || "";
+  }
+  function setCategoryDisplayName(catIdOrSlug, alias) {
+    try {
+      const map = getCategoryAliases();
+      if (alias) map[String(catIdOrSlug)] = alias;
+      else delete map[String(catIdOrSlug)];
+      localStorage.setItem(CATEGORY_ALIASES_KEY, JSON.stringify(map));
+    } catch { /* ignore */ }
+  }
+
+  function sanitizeWidth(val, defaultVal, minVal, maxVal) {
+    const num = typeof val === "number" ? val : parseFloat(val);
+    if (Number.isNaN(num) || !Number.isFinite(num)) return defaultVal;
+    return Math.min(Math.max(num, minVal), maxVal);
+  }
+
+  const PRESENTATION_PREFS_KEY = "linuxdo-codex-presentation-prefs";
+  function readPresentationPrefs(customStorage) {
+    const storage = customStorage || (typeof localStorage !== "undefined" ? localStorage : null);
+    const defaults = {
+      showThinking: false,
+      showRunlines: false,
+      demoMode: false
+    };
+    if (!storage) return defaults;
+    try {
+      const raw = storage.getItem(PRESENTATION_PREFS_KEY) || (typeof storage.getItem === "function" && storage.getItem("corrupt"));
+      if (!raw) return defaults;
+      const parsed = JSON.parse(raw);
+      return {
+        showThinking: Boolean(parsed.showThinking),
+        showRunlines: Boolean(parsed.showRunlines),
+        demoMode: Boolean(parsed.demoMode)
+      };
+    } catch {
+      return defaults;
+    }
+  }
+
+  function writePresentationPrefs(prefs) {
+    try {
+      localStorage.setItem(PRESENTATION_PREFS_KEY, JSON.stringify(prefs));
+    } catch { /* ignore */ }
+  }
+
   let categoriesExpanded = false; // 「分类」分组「展开显示」
   const expandedCats = new Set(); // 分类下子线程的逐组展开
   let catsDefaultSeeded = false; // 首次渲染时默认展开第一个分类
-  let recentTopicsCache = null;   // 「最近」分组：/latest.json 前几条
+  let recentTopicsCache = null;   // 「最新」分组：/latest.json 前几条
 
-  // 分类下的装饰性「session 名」文案池：真实话题不够数时用来凑版面
-  const MOCK_SESSIONS = [
-    "分析一下当前项目",
-    "只读分析前端界面与路由",
-    "修复 CI 打包报错",
-    "梳理一下接口鉴权协议",
-    "重构设置页布局",
-    "排查偶发白屏问题",
-    "整理组件依赖关系",
-    "调研跨平台路径兼容",
-    "补充单元测试覆盖",
-    "优化首屏加载性能",
-    "对比两套缓存方案",
-    "定位任务队列卡住的原因",
-  ];
-
-  /** 某分类的「session 列表」：真实话题优先，不足用文案池凑（按 catId 播种保证稳定） */
-  function sessionsForCat(cat, idx) {
-    const realPool = [...(listState.topics || []), ...(recentTopicsCache || [])]
-      .filter((t) => t.category_id === cat.id);
+  /** 某分类的「session 列表」：只展示真实话题，不填充虚构凑数条目 */
+  function sessionsForCat(cat, idx, customPool) {
+    if (!cat) return [];
+    const sourcePool = customPool || [...(listState.topics || []), ...(recentTopicsCache || [])];
+    const realPool = sourcePool.filter((t) => t.category_id === cat.id);
     const seen = new Set();
     const out = [];
     for (const t of realPool) {
       if (!t.title || seen.has(t.title)) continue;
       seen.add(t.title);
       out.push({ label: t.title, href: topicHref(t), unread: topicUnread(t) > 0 });
-      if (out.length >= 4) break;
-    }
-    for (let i = 0; out.length < 4 && i < MOCK_SESSIONS.length; i++) {
-      const pick = MOCK_SESSIONS[(cat.id * 5 + idx * 3 + i * 7) % MOCK_SESSIONS.length];
-      if (seen.has(pick)) { continue; }
-      seen.add(pick);
-      out.push({ label: pick, href: `/c/${cat.slug}/${cat.id}`, unread: false });
-    }
-    if (!out.length) {
-      out.push({ label: "分析一下当前项目", href: `/c/${cat.slug}/${cat.id}`, unread: false });
+      if (out.length >= 6) break;
     }
     return out;
   }
@@ -3817,17 +4169,35 @@
     rail.className = "codex-rail";
     rail.setAttribute("aria-label", "Codex 风导航");
 
-    // 顶部窗口控制占位（收起/后退/前进装饰图标）
+    // 顶部窗口控制按钮（宽屏侧栏折叠 / 站内后退 / 前进）
     const traffic = document.createElement("div");
     traffic.className = "codex-rail-traffic";
     traffic.innerHTML =
-      ICONS.sidebar +
-      ICONS.chevronLeft +
-      `<span style="opacity:0.45;display:inline-flex">${ICONS.chevronRight}</span>`;
-    // 收起图标：窄屏时收起抽屉；宽屏纯装饰
-    traffic.firstElementChild?.addEventListener?.("click", () => {
-      document.documentElement.classList.toggle("codex-rail-open");
+      `<button class="cx-traffic-btn cx-sidebar-toggle" title="折叠/展开侧栏" aria-label="折叠侧栏">${ICONS.sidebar}</button>` +
+      `<button class="cx-traffic-btn cx-nav-back" title="后退" aria-label="后退">${ICONS.chevronLeft}</button>` +
+      `<button class="cx-traffic-btn cx-nav-forward" title="前进" aria-label="前进">${ICONS.chevronRight}</button>`;
+
+    traffic.querySelector(".cx-sidebar-toggle")?.addEventListener("click", () => {
+      if (window.innerWidth <= 1024) {
+        document.documentElement.classList.toggle("codex-rail-open");
+      } else {
+        const collapsed = document.documentElement.classList.toggle("codex-rail-collapsed");
+        try { localStorage.setItem("linuxdo-codex-rail-collapsed", collapsed ? "1" : "0"); } catch { /* ignore */ }
+      }
     });
+
+    traffic.querySelector(".cx-nav-back")?.addEventListener("click", () => {
+      if (isTopicPath(location.pathname)) {
+        backToList();
+      } else {
+        window.history.back();
+      }
+    });
+
+    traffic.querySelector(".cx-nav-forward")?.addEventListener("click", () => {
+      window.history.forward();
+    });
+
     rail.appendChild(traffic);
 
     // 品牌行：Linux DO ⌄ + 搜索 + 通知铃铛
@@ -3843,17 +4213,16 @@
     brand.querySelector(".codex-rail-search-btn").addEventListener("click", () => openNativeSearch());
     rail.appendChild(brand);
 
-    // 可滚动区：导航项 + 动态分组（置顶/分类/最近）
+    // 可滚动区：导航项 + 动态分组（置顶/分类/最新）
     const scroll = document.createElement("div");
     scroll.className = "codex-rail-scroll";
     scroll.innerHTML = `
       <nav class="codex-rail-nav">
         <div class="codex-rail-item" data-nav="topics">${ICONS.layers}<span class="cx-label">话题</span></div>
-        <div class="codex-rail-item" data-nav="drafts" title="草稿保存在原生编辑器中">${ICONS.user}<span class="cx-label">我的草稿</span></div>
+        <div class="codex-rail-item" data-nav="drafts" title="新建话题">${ICONS.plus}<span class="cx-label">新话题</span></div>
         <div class="codex-rail-item" data-nav="messages">${ICONS.inbox}<span class="cx-label">我的消息</span></div>
-        <div class="codex-rail-item cx-faint" data-nav="bots" title="装饰入口（Codex 风格占位，无实际功能）">${ICONS.bot}<span class="cx-label">AI 机器人</span></div>
         <div class="codex-rail-item" data-nav="activity">${ICONS.clock}<span class="cx-label">近期活动</span></div>
-        <div class="codex-rail-item cx-faint" data-nav="more">${ICONS.dotsV}<span class="cx-label">更多</span></div>
+        <div class="codex-rail-item" data-nav="more" title="展开更多分类" aria-expanded="false">${ICONS.dotsV}<span class="cx-label">分类展开</span></div>
       </nav>
       <div class="codex-rail-dynamic"></div>`;
     rail.appendChild(scroll);
@@ -3896,9 +4265,6 @@
       closeRailDrawer();
       navigateInApp("/messages");
     });
-    scroll.querySelector('[data-nav="bots"]').addEventListener("click", () => {
-      closeRailDrawer();
-    });
     scroll.querySelector('[data-nav="activity"]').addEventListener("click", () => {
       closeRailDrawer();
       navigateInApp("/my/activity");
@@ -3908,7 +4274,6 @@
       delete rail.querySelector(".codex-rail-dynamic")?.dataset.sig;
       renderRailDynamic();
     });
-    // AI 机器人之外均为真实路由；bots 仅装饰（tooltip 已标）
 
     bindNotifTrigger(brand.querySelector(".codex-rail-bell"));
     bindNotifTrigger(foot.querySelector(".codex-rail-foot-user"));
@@ -3924,7 +4289,7 @@
     document.documentElement.classList.remove("codex-rail-open");
   }
 
-  /** rail 动态分组：置顶 / 分类 / 最近 */
+  /** rail 动态分组：置顶 / 分类 / 最新 */
   function renderRailDynamic() {
     const box = document.querySelector(".codex-rail-dynamic");
     if (!box) return;
@@ -3948,7 +4313,6 @@
     // 分类
     const cats = categoriesCache || [];
     if (cats.length) {
-      // 首次渲染默认展开第一个分类（用户手动收起后不再重置）
       if (!catsDefaultSeeded) {
         catsDefaultSeeded = true;
         expandedCats.add(cats[0].id);
@@ -3956,15 +4320,15 @@
       const shown = categoriesExpanded ? cats : cats.slice(0, 5);
       parts.push(`<div class="codex-rail-section">分类</div><div class="codex-rail-section-items">`);
       const curPath = location.pathname;
+      const catAliases = getCategoryAliases();
       for (const [idx, c] of shown.entries()) {
         const href = `/c/${c.slug}/${c.id}`;
         const active = curPath.startsWith(`/c/${c.slug}`);
-        // 分类下的「session」子条目：默认收起，点击分类下的「展开显示」才展开
-        // （对齐原版项目线程列表；避免每个分类下都挂子条目显得全部铺开）
         const open = expandedCats.has(c.id);
+        const displayName = getCategoryDisplayName(c, catAliases);
         parts.push(
-          `<div class="codex-rail-item${active ? " active" : ""}" data-href="${escapeHtml(href)}" title="${escapeHtml(c.name)}">` +
-          `${open ? ICONS.folderOpen : ICONS.folder}<span class="cx-label">${escapeHtml(c.name)}</span>` +
+          `<div class="codex-rail-item${active ? " active" : ""}" data-href="${escapeHtml(href)}" title="${escapeHtml(displayName)}">` +
+          `${open ? ICONS.folderOpen : ICONS.folder}<span class="cx-label">${escapeHtml(displayName)}</span>` +
           (c.unread > 0 ? `<span class="cx-dot"></span>` : "") +
           `</div>`
         );
@@ -3975,6 +4339,13 @@
             `<div class="codex-rail-item codex-rail-subitem" data-href="${escapeHtml(s.href)}" title="${escapeHtml(s.label)}">` +
             `<span class="cx-label">${escapeHtml(s.label)}</span>` +
             (s.unread ? `<span class="cx-dot"></span>` : "") +
+            `</div>`
+          );
+        }
+        if (open && !subs.length) {
+          parts.push(
+            `<div class="codex-rail-item codex-rail-subitem cx-faint">` +
+            `<span class="cx-label">暂无已加载话题</span>` +
             `</div>`
           );
         }
@@ -3996,10 +4367,10 @@
       parts.push(`</div>`);
     }
 
-    // 最近
+    // 最新（原“最近”，真实反映最新话题流）
     const recent = (recentTopicsCache || []).slice(0, 4);
     if (recent.length) {
-      parts.push(`<div class="codex-rail-section">最近</div><div class="codex-rail-section-items">`);
+      parts.push(`<div class="codex-rail-section">最新</div><div class="codex-rail-section-items">`);
       for (const t of recent) {
         parts.push(
           `<div class="codex-rail-item" data-href="${escapeHtml(topicHref(t))}" title="${escapeHtml(t.title)}">` +
@@ -4218,7 +4589,69 @@
         return;
       }
       if (e.target.closest("[data-open-native]")) {
-        window.open(location.href, "_blank", "noopener");
+        window.open(buildNativeUrl(location.href), "_blank", "noopener");
+        return;
+      }
+      // 切换代码面板中的具体片段
+      const selectSnip = e.target.closest("[data-select-snippet]");
+      if (selectSnip && main.contains(selectSnip)) {
+        activeSnippetId = selectSnip.dataset.selectSnippet;
+        renderCodePanel();
+        return;
+      }
+      // 从代码面板定位到原贴楼层
+      const locateBtn = e.target.closest("[data-locate-snippet]");
+      if (locateBtn && main.contains(locateBtn)) {
+        const postNo = locateBtn.dataset.locateSnippet;
+        const postEl = main.querySelector(`.cx-turn[data-post-number="${postNo}"], [data-post-number="${postNo}"]`);
+        if (postEl) {
+          postEl.scrollIntoView({ behavior: "smooth", block: "center" });
+          postEl.style.transition = "box-shadow 0.3s";
+          postEl.style.boxShadow = "0 0 0 2px var(--cx-brand)";
+          setTimeout(() => { postEl.style.boxShadow = ""; }, 1600);
+        }
+        return;
+      }
+      // 复制面板中的代码片段
+      const copySnipBtn = e.target.closest("[data-copy-snippet]");
+      if (copySnipBtn && main.contains(copySnipBtn)) {
+        const snipId = copySnipBtn.dataset.copySnippet;
+        const container = main.querySelector(".cx-thread-posts");
+        const snippets = extractThreadSnippets(container, threadState.topicId);
+        const s = snippets.find((x) => x.id === snipId);
+        if (s) {
+          copyText(s.code);
+          cxToast("代码片段已复制");
+        }
+        return;
+      }
+      // 代码块「侧栏查看」入口
+      const openInPanelBtn = e.target.closest(".cx-open-in-panel");
+      if (openInPanelBtn && main.contains(openInPanelBtn)) {
+        const pre = openInPanelBtn.closest(".cx-codeblock")?.querySelector("pre") || openInPanelBtn.closest("pre");
+        const turn = openInPanelBtn.closest("[data-post-number]");
+        const postNo = parseInt(turn?.dataset?.postNumber || "1", 10);
+        const container = main.querySelector(".cx-thread-posts");
+        const snippets = extractThreadSnippets(container, threadState.topicId);
+        const raw = (pre?.querySelector("code")?.textContent || pre?.textContent || "").replace(/\r\n/g, "\n").trim();
+        const matched = snippets.find((s) => s.postNumber === postNo && s.code === raw) || snippets.find((s) => s.postNumber === postNo);
+        if (matched) {
+          activeSnippetId = matched.id;
+        }
+        forceDemoCode = false;
+        setCodePanelHidden(false, true);
+        renderCodePanel();
+        return;
+      }
+      // 切换到示例演示模式 / 退出演示模式
+      if (e.target.closest(".cx-btn-switch-demo")) {
+        forceDemoCode = true;
+        renderCodePanel();
+        return;
+      }
+      if (e.target.closest(".cx-btn-exit-demo")) {
+        forceDemoCode = false;
+        renderCodePanel();
         return;
       }
       // 代码面板显隐：顶栏分屏按钮 / tab 行右侧按钮 / tab 上的 ×
@@ -4574,41 +5007,49 @@
 
   async function loadList(apiPath, force) {
     if (!apiPath) return;
-    // 用列表 API 做缓存键：进帖子时 pathname 会变，但不应重拉列表；
-    // 缓存命中只同步面包屑 / rail，不重绘行（避免抽屉开关等场景重置滚动）
-    if (!force && listState.apiPath === apiPath && listState.topics.length) {
-      syncChrome();
+    const reqKey = `list:${apiPath}`;
+    if (!force && listCoordinator.loadedKey === reqKey && listState.topics.length) {
+      syncAppChrome();
       renderRailDynamic();
       return;
     }
-    if (listState.loading) return;
-    // 失败冷却：10 秒内不重复请求（否则 Ember 的 DOM 抖动会触发 applyTheme → 重试风暴）
-    if (listState.failedAt && Date.now() - listState.failedAt < 10000) return;
+    // 手动重试 (force) 绕过失败冷却；自动请求受 8 秒防风暴保护
+    if (!force && listState.failedAt && Date.now() - listState.failedAt < 8000) return;
+
+    const req = listCoordinator.begin(reqKey);
     listState.loading = true;
     listState.apiPath = apiPath;
     listState.path = location.pathname;
     renderListRows();
+
     try {
-      const data = await api(apiPath);
-      if (listState.apiPath !== apiPath) return; // 路由已切走
+      const data = await api(apiPath, undefined, req.signal);
+      if (!req.isCurrent() || !isThemeActive()) return;
+      listCoordinator.succeed(req.requestId, reqKey);
       listState.failedAt = 0;
       applyListJson(data, false);
     } catch (err) {
+      if (err && err.name === "AbortError") return;
+      if (!req.isCurrent() || !isThemeActive()) return;
+      listCoordinator.fail(req.requestId, reqKey, err);
       listState.failedAt = Date.now();
       const status = /HTTP (\d+)/.exec(err && err.message || "")?.[1];
       const box = document.querySelector(".cx-thread-rows");
-      if (box) box.innerHTML = `<div class="cx-list-status">列表加载失败${
-        status === "403"
-          ? "（HTTP 403：可能被 Cloudflare 拦截或未登录，刷新页面或登录后重试）"
-          : status ? `（HTTP ${status}）` : ""
-      }，点击重试</div>`;
-      // 点错误行手动重试
-      box?.querySelector(".cx-list-status")?.addEventListener("click", () => {
-        listState.failedAt = 0;
-        loadList(apiPath, true);
-      }, { once: true });
+      if (box) {
+        box.innerHTML = `<div class="cx-list-status">列表加载失败${
+          status === "403"
+            ? "（HTTP 403：可能被拦截或未登录，登录后重试）"
+            : status ? `（HTTP ${status}）` : ""
+        }，<button class="cx-btn-retry" style="margin-left:6px;padding:2px 8px;cursor:pointer;background:var(--cx-brand);color:#fff;border:none;border-radius:4px;">点击重试</button></div>`;
+        box.querySelector(".cx-btn-retry")?.addEventListener("click", () => {
+          listState.failedAt = 0;
+          loadList(apiPath, true);
+        });
+      }
     } finally {
-      listState.loading = false;
+      if (req.isCurrent()) {
+        listState.loading = false;
+      }
     }
   }
 
@@ -4648,7 +5089,12 @@
       pre.replaceWith(wrap);
       const head = document.createElement("div");
       head.className = "cx-codeblock-head";
-      head.innerHTML = `<span>${escapeHtml(lang)}</span><span class="cx-copy">${ICONS.copy}复制</span>`;
+      head.innerHTML =
+        `<span>${escapeHtml(lang)}</span>` +
+        `<div style="display:flex;align-items:center;gap:6px;">` +
+        `<span class="cx-copy" title="复制代码">${ICONS.copy}复制</span>` +
+        `<span class="cx-open-in-panel" title="在右侧代码面板中查看">${ICONS.panel}侧栏查看</span>` +
+        `</div>`;
       wrap.appendChild(head);
       wrap.appendChild(pre);
     });
@@ -4797,11 +5243,12 @@
       cxToast("楼层正在加载，请稍候", "info");
       return;
     }
-    const topicId = threadState.topicId;
+    const targetTopicId = threadState.topicId;
+    const curReqId = topicCoordinator.currentRequestId;
     threadState.loading = true;
     try {
-      const data = await api(`/t/${topicId}/${n}.json`);
-      if (threadState.topicId !== topicId) return; // 路由已切走
+      const data = await api(`/t/${targetTopicId}/${n}.json`);
+      if (!topicCoordinator.isCurrent(curReqId) || threadState.topicId !== targetTopicId || !isThemeActive()) return;
       const posts = (data.post_stream && data.post_stream.posts) || [];
       if (!posts.length) {
         cxToast(`#${n} 楼未找到`, "error");
@@ -4839,11 +5286,15 @@
         }
       }
 
-      // 更新已渲染区间，后续滚动续接（loadOlder/Newer）按新区间切流
+      // 更新已渲染区间：仅当与现有区间接壤时扩展，防止跳过未加载缺口
       const wFirst = threadState.stream.indexOf(posts[0].id);
       const wLast = threadState.stream.indexOf(posts[posts.length - 1].id);
-      if (wFirst >= 0) threadState.renderedFirstIdx = Math.min(threadState.renderedFirstIdx, wFirst);
-      if (wLast >= 0) threadState.renderedLastIdx = Math.max(threadState.renderedLastIdx, wLast);
+      if (wFirst >= 0 && wLast >= 0) {
+        if (wLast >= threadState.renderedFirstIdx - 5 && wFirst <= threadState.renderedLastIdx + 5) {
+          threadState.renderedFirstIdx = Math.min(threadState.renderedFirstIdx, wFirst);
+          threadState.renderedLastIdx = Math.max(threadState.renderedLastIdx, wLast);
+        }
+      }
       threadState.hasOlder = threadState.renderedFirstIdx > 0;
       threadState.hasNewer = threadState.renderedLastIdx >= 0 &&
         threadState.renderedLastIdx < threadState.stream.length - 1;
@@ -4857,7 +5308,9 @@
     } catch {
       cxToast(`#${n} 楼加载失败`, "error");
     } finally {
-      threadState.loading = false;
+      if (topicCoordinator.isCurrent(curReqId)) {
+        threadState.loading = false;
+      }
     }
   }
 
@@ -5368,10 +5821,11 @@
   const RAIL_W_KEY = "linuxdo-codex-rail-w";
   const PANEL_W_KEY = "linuxdo-codex-panel-w";
 
-  function storedWidth(key, min, max) {
+  function storedWidth(key, min, max, def) {
     try {
-      const v = parseInt(localStorage.getItem(key), 10);
-      if (!Number.isNaN(v)) return Math.min(max, Math.max(min, v));
+      const raw = localStorage.getItem(key);
+      if (raw === null || raw === undefined) return null;
+      return sanitizeWidth(raw, def ?? null, min, max);
     } catch { /* ignore */ }
     return null;
   }
@@ -5406,6 +5860,9 @@
           : (document.querySelector(".cx-code-panel")?.getBoundingClientRect().width || 500);
         rz.classList.add("cx-dragging");
         document.body.classList.add("codex-resizing");
+        if (typeof rz.setPointerCapture === "function") {
+          try { rz.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+        }
         const move = (ev) => {
           const dx = ev.clientX - startX;
           if (kind === "rail") {
@@ -5420,6 +5877,9 @@
         const up = () => {
           rz.classList.remove("cx-dragging");
           document.body.classList.remove("codex-resizing");
+          if (typeof rz.releasePointerCapture === "function") {
+            try { rz.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+          }
           document.removeEventListener("pointermove", move);
           document.removeEventListener("pointerup", up);
           persistWidth(RAIL_W_KEY, parseFloat(getComputedStyle(rootEl).getPropertyValue("--cx-rail-w")) || 306);
@@ -5516,21 +5976,205 @@
     }
   };
 
-  /** 迷你语法高亮（字符串 → 转义 → 关键字/数字/类型 → 注释） */
-  function highlightCode(line, L) {
-    let s = line, cm = "";
-    const ci = s.indexOf(L.comment);
-    if (ci >= 0) { cm = s.slice(ci); s = s.slice(0, ci); }
-    const slots = [];
-    const stash = (m) => { slots.push(m); return "\u0001" + (slots.length - 1) + "\u0002"; };
-    s = s.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`/g, (m) => stash('<span class="tk-s">' + escapeHtml(m) + "</span>"));
-    s = escapeHtml(s);
-    s = s.replace(new RegExp("\\b(" + L.kw.join("|") + ")\\b", "g"), '<span class="tk-k">$1</span>');
-    s = s.replace(/\b(\d[\d_]*(?:\.\d+)?)\b/g, '<span class="tk-n">$1</span>');
-    s = s.replace(/\b([A-Z][A-Za-z0-9]+)\b/g, '<span class="tk-t">$1</span>');
-    s = s.replace(/\u0001(\d+)\u0002/g, (_, i) => slots[+i]);
-    if (cm) s += '<span class="tk-c">' + escapeHtml(cm) + "</span>";
-    return s;
+  const CODE_LANG_ALIASES = {
+    ts: "typescript",
+    js: "typescript",
+    javascript: "typescript",
+    py: "python",
+    rs: "rust",
+    golang: "go"
+  };
+
+  /**
+   * 字符级 Token 扫描器：保证 token 原文拼接严格等于输入，不漏字、不吞字、不修改原文。
+   */
+  function tokenizeCode(text, lang) {
+    if (typeof text !== "string") return [];
+    let langKey = "";
+    let L = null;
+    if (typeof lang === "string") {
+      langKey = CODE_LANG_ALIASES[lang.toLowerCase()] || lang.toLowerCase();
+      L = CODE_LANGS[langKey] || null;
+    } else if (typeof lang === "object" && lang !== null) {
+      L = lang;
+      langKey = (lang.key || "").toLowerCase();
+    }
+
+    const keywords = new Set(
+      (L && Array.isArray(L.kw) ? L.kw : null) || [
+        "const", "let", "var", "function", "return", "if", "else", "for", "while",
+        "import", "from", "export", "default", "class", "extends", "new", "this",
+        "async", "await", "try", "catch", "finally", "throw", "switch", "case", "break",
+        "def", "in", "is", "not", "and", "or", "lambda", "None", "True", "False", "pass", "yield",
+        "fn", "mut", "pub", "use", "struct", "enum", "match", "mod", "crate", "self", "Self",
+        "where", "trait", "loop", "func", "package", "range", "go", "chan", "select", "defer", "nil"
+      ]
+    );
+
+    const lineCommentChar = (L && L.comment) || (langKey === "python" || langKey === "py" || langKey === "sh" || langKey === "bash" ? "#" : "//");
+    const hasSlashStarComment = lineCommentChar === "//";
+
+    const tokens = [];
+    let i = 0;
+    const len = text.length;
+
+    while (i < len) {
+      const ch = text[i];
+      const next = text[i + 1];
+
+      // 1. 行注释（非字符串内部）：必须先于普通斜杠判断
+      if (text.startsWith(lineCommentChar, i)) {
+        let end = text.indexOf("\n", i);
+        if (end === -1) end = len;
+        tokens.push({ type: "comment", text: text.slice(i, end) });
+        i = end;
+        continue;
+      }
+
+      // 2. 块注释 /* ... */
+      if (hasSlashStarComment && ch === "/" && next === "*") {
+        let end = text.indexOf("*/", i + 2);
+        if (end === -1) end = len;
+        else end += 2;
+        tokens.push({ type: "comment", text: text.slice(i, end) });
+        i = end;
+        continue;
+      }
+
+      // 3. Python 三引号字符串 """ 或 '''
+      if ((langKey === "python" || langKey === "py" || !L) && (text.startsWith('"""', i) || text.startsWith("'''", i))) {
+        const q = text.slice(i, i + 3);
+        let j = i + 3;
+        while (j < len) {
+          if (text[j] === "\\" && j + 1 < len) {
+            j += 2;
+          } else if (text.startsWith(q, j)) {
+            j += 3;
+            break;
+          } else {
+            j++;
+          }
+        }
+        tokens.push({ type: "string", text: text.slice(i, j) });
+        i = j;
+        continue;
+      }
+
+      // 4. 标准引号字符串：", ', `
+      if (ch === '"' || ch === "'" || ch === "`") {
+        const q = ch;
+        let j = i + 1;
+        while (j < len) {
+          if (text[j] === "\\" && j + 1 < len) {
+            j += 2;
+          } else if (text[j] === q) {
+            j++;
+            break;
+          } else if (q !== "`" && (text[j] === "\n" || text[j] === "\r")) {
+            // 单引号/双引号如遇换行且未转义，截断以避免跨行污染
+            break;
+          } else {
+            j++;
+          }
+        }
+        tokens.push({ type: "string", text: text.slice(i, j) });
+        i = j;
+        continue;
+      }
+
+      // 5. 数字：支持 0x十六进制、0b二进制、下划线数字、小数与指数
+      if (/\d/.test(ch) || (ch === "." && /\d/.test(next || ""))) {
+        const prev = i > 0 ? text[i - 1] : "";
+        if (!/[a-zA-Z0-9_$]/.test(prev)) {
+          let j = i;
+          if (text.startsWith("0x", j) || text.startsWith("0X", j)) {
+            j += 2;
+            while (j < len && /[0-9a-fA-F_]/.test(text[j])) j++;
+          } else if (text.startsWith("0b", j) || text.startsWith("0B", j)) {
+            j += 2;
+            while (j < len && /[01_]/.test(text[j])) j++;
+          } else {
+            let hasDot = ch === ".";
+            j++;
+            while (j < len) {
+              const c = text[j];
+              if (/\d/.test(c) || c === "_") {
+                j++;
+              } else if (c === "." && !hasDot && /\d/.test(text[j + 1] || "")) {
+                hasDot = true;
+                j++;
+              } else if ((c === "e" || c === "E") && /[\d+-]/.test(text[j + 1] || "")) {
+                j += 2;
+                while (j < len && /\d/.test(text[j])) j++;
+              } else {
+                break;
+              }
+            }
+          }
+          tokens.push({ type: "number", text: text.slice(i, j) });
+          i = j;
+          continue;
+        }
+      }
+
+      // 6. 标识符 / 关键字 / 类型
+      if (/[a-zA-Z_$]/.test(ch)) {
+        let j = i + 1;
+        while (j < len && /[a-zA-Z0-9_$]/.test(text[j])) {
+          j++;
+        }
+        const word = text.slice(i, j);
+        if (keywords.has(word)) {
+          tokens.push({ type: "keyword", text: word });
+        } else if (/^[A-Z][A-Za-z0-9_]+$/.test(word)) {
+          tokens.push({ type: "type", text: word });
+        } else {
+          tokens.push({ type: "plain", text: word });
+        }
+        i = j;
+        continue;
+      }
+
+      // 7. 普通字符与空白
+      tokens.push({ type: "plain", text: ch });
+      i++;
+    }
+
+    return tokens;
+  }
+
+  /**
+   * 语法高亮：读取原始文本 → 识别 token → 转义 → 一次生成 HTML。
+   * 彻底避免占位符污染和多重正则匹配冲突，DOM 渲染后 textContent 严格等于原代码。
+   */
+  function highlightCode(code, L) {
+    if (!code) return "";
+    const tokens = tokenizeCode(code, L);
+    let html = "";
+    for (const tok of tokens) {
+      const esc = escapeHtml(tok.text);
+      switch (tok.type) {
+        case "string":
+          html += '<span class="tk-s">' + esc + "</span>";
+          break;
+        case "comment":
+          html += '<span class="tk-c">' + esc + "</span>";
+          break;
+        case "keyword":
+          html += '<span class="tk-k">' + esc + "</span>";
+          break;
+        case "number":
+          html += '<span class="tk-n">' + esc + "</span>";
+          break;
+        case "type":
+          html += '<span class="tk-t">' + esc + "</span>";
+          break;
+        default:
+          html += esc;
+          break;
+      }
+    }
+    return html;
   }
 
   /** 按 话题id+语言 稳定生成一长段代码 */
@@ -5557,30 +6201,267 @@
     return h;
   }
 
+  const DEMO_CODE_BEFORE = [
+    "// Linux DO Codex · 演示环境",
+    "// 这是一个用于展示文本差异比较的静态示例代码",
+    "",
+    "interface TopicCacheEntry {",
+    "  topicId: number;",
+    "  title: string;",
+    "  loadedAt: number;",
+    "}",
+    "",
+    "class TopicService {",
+    "  private cache = new Map<number, TopicCacheEntry>();",
+    "  private ttl = 60000;",
+    "",
+    "  async fetchTopic(id: number) {",
+    "    const hit = this.cache.get(id);",
+    "    if (hit && Date.now() - hit.loadedAt < this.ttl) {",
+    "      return hit;",
+    "    }",
+    "    const res = await fetch(`/t/${id}.json`);",
+    "    const data = await res.json();",
+    "    this.cache.set(id, { topicId: id, title: data.title, loadedAt: Date.now() });",
+    "    return data;",
+    "  }",
+    "}"
+  ].join("\n");
+
+  const DEMO_CODE_AFTER = [
+    "// Linux DO Codex · 演示环境",
+    "// 这是一个用于展示文本差异比较的静态示例代码",
+    "",
+    "interface TopicCacheEntry {",
+    "  topicId: number;",
+    "  title: string;",
+    "  loadedAt: number;",
+    "  version: number;",
+    "}",
+    "",
+    "class TopicService {",
+    "  private cache = new Map<number, TopicCacheEntry>();",
+    "  private ttl = 60000;",
+    "",
+    "  async fetchTopic(id: number, signal?: AbortSignal) {",
+    "    const hit = this.cache.get(id);",
+    "    if (hit && Date.now() - hit.loadedAt < this.ttl) {",
+    "      return hit;",
+    "    }",
+    "    const res = await fetch(`/t/${id}.json`, { signal });",
+    "    if (!res.ok) throw new Error(`HTTP ${res.status}`);",
+    "    const data = await res.json();",
+    "    this.cache.set(id, { topicId: id, title: data.title, loadedAt: Date.now(), version: 2 });",
+    "    return data;",
+    "  }",
+    "}"
+  ].join("\n");
+
+  function extForLang(lang) {
+    const map = {
+      typescript: "ts",
+      javascript: "js",
+      python: "py",
+      rust: "rs",
+      go: "go",
+      java: "java",
+      json: "json",
+      html: "html",
+      css: "css",
+      sql: "sql",
+      shell: "sh",
+      bash: "sh"
+    };
+    return map[lang] || "txt";
+  }
+
+  function computeTextDiff(oldText, newText) {
+    if (oldText === newText) {
+      return { isIdentical: true, additions: 0, deletions: 0, hunks: [] };
+    }
+    const oldLines = typeof oldText === "string" && oldText.length > 0 ? oldText.split(/\r?\n/) : [];
+    const newLines = typeof newText === "string" && newText.length > 0 ? newText.split(/\r?\n/) : [];
+
+    const m = oldLines.length;
+    const n = newLines.length;
+    const dp = Array.from({ length: m + 1 }, () => new Int32Array(n + 1));
+    for (let i = 0; i < m; i++) {
+      for (let j = 0; j < n; j++) {
+        if (oldLines[i] === newLines[j]) {
+          dp[i + 1][j + 1] = dp[i][j] + 1;
+        } else {
+          dp[i + 1][j + 1] = Math.max(dp[i][j + 1], dp[i + 1][j]);
+        }
+      }
+    }
+
+    let i = m;
+    let j = n;
+    const edits = [];
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+        edits.push({ kind: "context", text: oldLines[i - 1] });
+        i--;
+        j--;
+      } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+        edits.push({ kind: "add", text: newLines[j - 1] });
+        j--;
+      } else if (i > 0 && (j === 0 || dp[i][j - 1] < dp[i - 1][j])) {
+        edits.push({ kind: "del", text: oldLines[i - 1] });
+        i--;
+      }
+    }
+    edits.reverse();
+
+    let additions = 0;
+    let deletions = 0;
+    for (const e of edits) {
+      if (e.kind === "add") additions++;
+      if (e.kind === "del") deletions++;
+    }
+
+    if (additions === 0 && deletions === 0) {
+      return { isIdentical: true, additions: 0, deletions: 0, hunks: [] };
+    }
+
+    const contextLines = 3;
+    const changeIndices = [];
+    for (let k = 0; k < edits.length; k++) {
+      if (edits[k].kind !== "context") {
+        changeIndices.push(k);
+      }
+    }
+
+    const clusters = [];
+    let curCluster = [changeIndices[0]];
+    for (let k = 1; k < changeIndices.length; k++) {
+      const idx = changeIndices[k];
+      const prevIdx = curCluster[curCluster.length - 1];
+      if (idx - prevIdx <= 2 * contextLines + 1) {
+        curCluster.push(idx);
+      } else {
+        clusters.push(curCluster);
+        curCluster = [idx];
+      }
+    }
+    clusters.push(curCluster);
+
+    const hunks = [];
+    for (const cluster of clusters) {
+      const firstChange = cluster[0];
+      const lastChange = cluster[cluster.length - 1];
+      const startEditIdx = Math.max(0, firstChange - contextLines);
+      const endEditIdx = Math.min(edits.length - 1, lastChange + contextLines);
+
+      let curO = 1;
+      let curN = 1;
+      for (let k = 0; k < startEditIdx; k++) {
+        if (edits[k].kind === "del" || edits[k].kind === "context") curO++;
+        if (edits[k].kind === "add" || edits[k].kind === "context") curN++;
+      }
+      const hOldStart = curO;
+      const hNewStart = curN;
+
+      const lines = [];
+      let oCount = 0;
+      let nCount = 0;
+
+      for (let k = startEditIdx; k <= endEditIdx; k++) {
+        const e = edits[k];
+        if (e.kind === "context") {
+          lines.push({ kind: "context", text: e.text, oldLineNo: curO, newLineNo: curN });
+          curO++;
+          curN++;
+          oCount++;
+          nCount++;
+        } else if (e.kind === "del") {
+          lines.push({ kind: "del", text: e.text, oldLineNo: curO });
+          curO++;
+          oCount++;
+        } else if (e.kind === "add") {
+          lines.push({ kind: "add", text: e.text, newLineNo: curN });
+          curN++;
+          nCount++;
+        }
+      }
+
+      const header = `@@ -${hOldStart},${oCount} +${hNewStart},${nCount} @@`;
+      hunks.push({
+        header,
+        oldStart: hOldStart,
+        oldCount: oCount,
+        newStart: hNewStart,
+        newCount: nCount,
+        lines
+      });
+    }
+
+    return {
+      isIdentical: false,
+      additions,
+      deletions,
+      hunks
+    };
+  }
+
+  function extractThreadSnippets(container, topicId) {
+    if (!container || typeof container.querySelectorAll !== "function") return [];
+    const posts = container.querySelectorAll(".cx-turn, [data-post-number]");
+    const snippets = [];
+    const topId = topicId || (typeof threadState !== "undefined" ? threadState.topicId : null) || 0;
+
+    posts.forEach((post) => {
+      const postNum = parseInt(post.dataset?.postNumber || "1", 10);
+      const postId = post.dataset?.postId || "";
+      const preNodes = typeof post.querySelectorAll === "function" ? post.querySelectorAll("pre") : [];
+      let blockIdx = 0;
+      preNodes.forEach((pre) => {
+        if (typeof pre.closest === "function") {
+          if (pre.closest("aside.quote, blockquote, .quote, [data-codex-decorative='1']")) return;
+        }
+        const codeEl = (typeof pre.querySelector === "function" && pre.querySelector("code")) || pre;
+        const raw = (codeEl.textContent || "").replace(/\r\n/g, "\n").trim();
+        if (!raw) return;
+
+        const cls = codeEl.className || "";
+        const match = cls.match(/(?:lang|language)-([a-z0-9_#+-]+)/i);
+        let langRaw = match ? match[1].toLowerCase() : "text";
+        let mappedLang = CODE_LANG_ALIASES[langRaw] || langRaw;
+
+        const snippetId = `snippet-${topId}-${postNum}-${blockIdx}`;
+        snippets.push({
+          id: snippetId,
+          topicId: topId,
+          postId: postId,
+          postNumber: postNum,
+          index: blockIdx,
+          lang: mappedLang,
+          code: raw,
+          lineCount: raw.split("\n").length
+        });
+        blockIdx++;
+      });
+    });
+
+    return snippets;
+  }
+
+  let activeSnippetId = null;
+  let forceDemoCode = false;
+
   function renderCodePanel() {
     const main = document.querySelector(".codex-main");
     if (!main) return;
     const body = main.querySelector("[data-code-body]");
     if (!body) return;
-    const langKey = getCodeLang();
-    const mode = getCodeMode();
-    const seed = codePanelSeed();
-    // 同种子同语言同模式不重复渲染（避免闪烁 / observer 空转）
-    const sig = `${langKey}:${mode}:${seed}`;
-    if (sig === codePanelLastSig && body.childElementCount) return;
-    codePanelLastSig = sig;
 
-    const L = CODE_LANGS[langKey];
     const fileEl = main.querySelector("[data-code-file-name]");
     const crumbFile = main.querySelector("[data-code-crumb-file]");
     const crumbDir = main.querySelector("[data-code-crumb-dir]");
     const crumbCat = main.querySelector("[data-code-crumb-cat]");
     const iconEl = main.querySelector(".cx-code-tab .cx-rs-ic");
-    if (fileEl) fileEl.textContent = L.file;
-    if (crumbFile) crumbFile.textContent = L.file;
-    if (crumbDir) crumbDir.textContent = L.dir;
-    if (iconEl) iconEl.textContent = L.icon;
-    // 假路径：详情 = linux-do › <分类 slug 或话题 slug> › …；列表 = linux-do › <列表标题> › …
+    const mode = getCodeMode();
+
     if (crumbCat) {
       if (isTopicPath(location.pathname)) {
         const cat = threadState.categoryId ? categoryById(threadState.categoryId) : null;
@@ -5589,48 +6470,133 @@
         crumbCat.textContent = listTitleForPath(location.pathname);
       }
     }
-    const openLabel = main.querySelector("[data-open-lang-label]");
-    if (openLabel) openLabel.textContent = CODE_LANG_NAMES[langKey] || langKey;
+
     main.querySelectorAll("[data-code-view-toggle] span").forEach((x) =>
       x.classList.toggle("cx-on", x.dataset.v === mode)
     );
 
-    const lines = genCodeLines(langKey, seed);
-    if (mode === "code") {
-      body.innerHTML = lines.map((ln, i) =>
-        '<div class="cx-cline"><span class="cx-ln">' + (i + 1) + '</span><span class="cx-lc">' + highlightCode(ln, L) + "</span></div>"
-      ).join("");
+    const isTopic = isTopicPath(location.pathname);
+    const container = document.querySelector(".cx-thread-posts");
+    const snippets = (isTopic && container) ? extractThreadSnippets(container, threadState.topicId) : [];
+
+    // 1. 真实线程中包含代码片段
+    if (isTopic && snippets.length > 0 && !forceDemoCode) {
+      let activeSnippet = snippets.find((s) => s.id === activeSnippetId);
+      if (!activeSnippet) {
+        activeSnippet = snippets[0];
+        activeSnippetId = activeSnippet.id;
+      }
+
+      const ext = extForLang(activeSnippet.lang);
+      const fileName = `snippet-${activeSnippet.postNumber}-${activeSnippet.index + 1}.${ext}`;
+      if (fileEl) fileEl.textContent = fileName;
+      if (crumbFile) crumbFile.textContent = fileName;
+      if (crumbDir) crumbDir.textContent = `${activeSnippet.postNumber}楼代码`;
+      if (iconEl) iconEl.textContent = ext.toUpperCase().slice(0, 2);
+
+      const openLabel = main.querySelector("[data-open-lang-label]");
+      if (openLabel) openLabel.textContent = CODE_LANG_NAMES[activeSnippet.lang] || activeSnippet.lang;
+
+      let selectorHtml = "";
+      if (snippets.length > 1) {
+        selectorHtml = `<div class="cx-snippet-selector" style="padding: 6px 12px; background: var(--cx-wash); border-bottom: 1px solid var(--cx-border); display: flex; gap: 8px; overflow-x: auto; align-items: center; font-size: 12px;">` +
+          snippets.map((s) => {
+            const active = s.id === activeSnippet.id;
+            return `<button type="button" class="cx-snippet-chip${active ? " cx-on" : ""}" data-select-snippet="${s.id}" style="padding: 3px 8px; border-radius: 4px; border: 1px solid ${active ? "var(--cx-brand)" : "var(--cx-border)"}; background: ${active ? "var(--cx-brand)" : "transparent"}; color: ${active ? "#fff" : "var(--cx-text)"}; cursor: pointer; white-space: nowrap;">#${s.postNumber} (${s.lineCount}行)</button>`;
+          }).join("") +
+          `</div>`;
+      }
+
+      const actionsHtml = `<div style="padding: 6px 12px; background: var(--cx-panel-header,#1e1e1e); border-bottom: 1px solid var(--cx-border); display: flex; justify-content: space-between; align-items: center; font-size: 12px;">` +
+        `<div style="color: var(--cx-muted);">来自 #${activeSnippet.postNumber} 楼 · ${activeSnippet.lineCount} 行</div>` +
+        `<div style="display: flex; gap: 8px;">` +
+        `<button class="cx-btn-locate" data-locate-snippet="${activeSnippet.postNumber}" style="padding: 2px 8px; background: transparent; border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; display: flex; align-items: center; gap: 4px;">${ICONS.external}定位来源</button>` +
+        `<button class="cx-btn-copy-snip" data-copy-snippet="${activeSnippet.id}" style="padding: 2px 8px; background: transparent; border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; display: flex; align-items: center; gap: 4px;">${ICONS.copy}复制</button>` +
+        `</div>` +
+        `</div>`;
+
+      if (mode === "code") {
+        const lines = activeSnippet.code.split("\n");
+        const linesHtml = lines.map((ln, i) =>
+          '<div class="cx-cline"><span class="cx-ln">' + (i + 1) + '</span><span class="cx-lc">' + highlightCode(ln, activeSnippet.lang) + "</span></div>"
+        ).join("");
+        body.innerHTML = selectorHtml + actionsHtml + linesHtml;
+      } else {
+        body.innerHTML = selectorHtml + actionsHtml +
+          `<div style="padding: 32px 16px; text-align: center; color: var(--cx-muted); font-size: 13px;">` +
+          `<div style="margin-bottom: 8px;">ℹ️</div>` +
+          `<div style="margin-bottom: 6px; color: var(--cx-text); font-weight: 500;">单个代码片段暂无历史版本对比</div>` +
+          `<div style="font-size: 12px; line-height: 1.6; margin-bottom: 14px;">此代码片段来源于帖子内容，站点未提供历史修订记录。<br>可切换至示例演示查看真实 diff 计算效果。</div>` +
+          `<button class="cx-btn-switch-demo" style="padding: 4px 12px; background: var(--cx-wash); border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; font-size: 12px;">查看示例 Diff</button>` +
+          `</div>`;
+      }
       return;
     }
-    // diff 模式：同一批代码切片，随机 +/−/上下文
-    const rnd = mulberry32((seed * 97 + langKey.length * 13 + 13) | 0);
-    const rows = [
-      ["meta", "diff --git a/" + L.dir + "/" + L.file + " b/" + L.dir + "/" + L.file],
-      ["meta", "index 8f3a2c1..e9d47b5 100644"],
-      ["meta", "--- a/" + L.dir + "/" + L.file],
-      ["meta", "+++ b/" + L.dir + "/" + L.file]
-    ];
-    let i = 0, guard = 0;
-    while (i < lines.length - 12 && guard++ < 40) {
-      const start = i + 1;
-      const chunk = 6 + Math.floor(rnd() * 10);
-      rows.push(["hunk", "@@ -" + start + "," + chunk + " +" + start + "," + (chunk + 2) + " @@"]);
-      for (let k = 0; k < chunk && i < lines.length; k++, i++) {
-        const r = rnd();
-        const kind = r < 0.25 ? "del" : r < 0.5 ? "add" : "";
-        const sign = kind === "del" ? "-" : kind === "add" ? "+" : " ";
-        rows.push([kind, sign + " " + lines[i]]);
-      }
-      i += 2; // hunk 间隔
+
+    // 2. 真实线程已加载楼层无代码片段
+    if (isTopic && !forceDemoCode && snippets.length === 0) {
+      if (fileEl) fileEl.textContent = "无代码片段";
+      if (crumbFile) crumbFile.textContent = "无代码片段";
+      if (crumbDir) crumbDir.textContent = "content";
+      if (iconEl) iconEl.textContent = "TXT";
+
+      body.innerHTML = `
+        <div class="cx-code-empty" style="padding: 48px 20px; text-align: center; color: var(--cx-muted);">
+          <div style="font-size: 28px; margin-bottom: 10px;">📄</div>
+          <div style="font-size: 13px; font-weight: 500; margin-bottom: 6px; color: var(--cx-text);">已加载内容中暂无代码片段</div>
+          <div style="font-size: 12px; line-height: 1.6; margin-bottom: 16px;">当前已加载的楼层中未包含代码块。<br>向下滚动加载更多回复，或切换至示例演示模式。</div>
+          <button class="cx-btn-switch-demo" style="padding: 6px 14px; background: var(--cx-wash); border: 1px solid var(--cx-border); border-radius: 6px; color: var(--cx-text); cursor: pointer; font-size: 12px;">切换到示例演示</button>
+        </div>`;
+      return;
     }
-    body.innerHTML = rows.map(([kind, ln], n) => {
-      const isHead = kind === "meta" || kind === "hunk";
-      const num = isHead ? "" : String(n);
-      const sign = ln.startsWith("+") ? "+ " : ln.startsWith("-") ? "- " : "  ";
-      const content = isHead ? escapeHtml(ln) : sign + highlightCode(ln.slice(2), L);
-      const cls = kind ? " cx-" + kind : "";
-      return '<div class="cx-cline' + cls + '"><span class="cx-ln">' + num + '</span><span class="cx-lc">' + content + "</span></div>";
-    }).join("");
+
+    // 3. 示例演示模式（非随机，真实文本 diff 计算）
+    const demoFileName = "TopicService.ts";
+    if (fileEl) fileEl.textContent = demoFileName;
+    if (crumbFile) crumbFile.textContent = demoFileName;
+    if (crumbDir) crumbDir.textContent = "src/services";
+    if (iconEl) iconEl.textContent = "TS";
+    const openLabel = main.querySelector("[data-open-lang-label]");
+    if (openLabel) openLabel.textContent = "TypeScript";
+
+    const demoBanner = isTopic ? `
+      <div style="padding: 6px 12px; background: var(--cx-wash); border-bottom: 1px solid var(--cx-border); display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--cx-muted);">
+        <span>示例演示模式 (本地静态数据)</span>
+        <button class="cx-btn-exit-demo" style="padding: 2px 6px; background: transparent; border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; font-size: 11px;">返回真实片段</button>
+      </div>` : "";
+
+    if (mode === "code") {
+      const lines = DEMO_CODE_AFTER.split("\n");
+      body.innerHTML = demoBanner + lines.map((ln, i) =>
+        '<div class="cx-cline"><span class="cx-ln">' + (i + 1) + '</span><span class="cx-lc">' + highlightCode(ln, "typescript") + "</span></div>"
+      ).join("");
+    } else {
+      const diff = computeTextDiff(DEMO_CODE_BEFORE, DEMO_CODE_AFTER);
+      const rows = [
+        ["meta", `diff --git a/src/services/${demoFileName} b/src/services/${demoFileName}`],
+        ["meta", `--- a/src/services/${demoFileName} (before)`],
+        ["meta", `+++ b/src/services/${demoFileName} (after)`],
+        ["meta", `@@ +${diff.additions} -${diff.deletions} @@`]
+      ];
+
+      for (const hunk of diff.hunks) {
+        rows.push(["hunk", hunk.header]);
+        for (const line of hunk.lines) {
+          const sign = line.kind === "add" ? "+" : line.kind === "del" ? "-" : " ";
+          const lnNo = line.kind === "del" ? String(line.oldLineNo) : String(line.newLineNo || "");
+          rows.push([line.kind, sign + " " + line.text, lnNo]);
+        }
+      }
+
+      body.innerHTML = demoBanner + rows.map(([kind, ln, lnNo], n) => {
+        const isHead = kind === "meta" || kind === "hunk";
+        const num = isHead ? "" : (lnNo || String(n));
+        const sign = ln.startsWith("+") ? "+ " : ln.startsWith("-") ? "- " : "  ";
+        const textContent = isHead ? escapeHtml(ln) : sign + highlightCode(ln.slice(2), "typescript");
+        const cls = kind ? " cx-" + kind : "";
+        return '<div class="cx-cline' + cls + '"><span class="cx-ln">' + num + '</span><span class="cx-lc">' + textContent + "</span></div>";
+      }).join("");
+    }
   }
 
   /* ============================== 详情视图（帖子 = agent thread） ============================== */
@@ -5776,7 +6742,7 @@ const THINK_CLOSERS = [
     "That's enough analysis — the practical next step is obvious."
   ];
 
-  /** 英文思考块：head「Worked for Ns」+ 可折叠 body（参考 cli 皮肤 tt-thinking） */
+  /** 英文思考块：head「Worked for Ns」+ 可折叠 body（默认收起静止，带有独立装饰标记） */
   function buildThinking(rnd) {
     const secs = 2 + Math.floor(rnd() * 46);
     const pick = (pool) => pool[Math.floor(rnd() * pool.length)];
@@ -5785,7 +6751,8 @@ const THINK_CLOSERS = [
     if (rnd() < 0.65) sentences.push(pick(THINK_MIDS));
     if (rnd() < 0.6) sentences.push(pick(THINK_CLOSERS));
     const div = document.createElement("div");
-    div.className = "cx-think open";
+    div.className = "cx-think";
+    div.dataset.codexDecorative = "1";
     div.innerHTML =
       `<div class="cx-think-head"><span class="spin">✻</span><span>Worked for ${secs}s</span><span class="cx-think-chev"></span></div>` +
       `<div class="cx-think-body">${escapeHtml(sentences.join("\n\n"))}</div>`;
@@ -5797,6 +6764,10 @@ const THINK_CLOSERS = [
 
   function sprinkleActivity(holder) {
     if (!holder) return;
+    const prefs = readPresentationPrefs();
+    if (!prefs.showThinking && !prefs.showRunlines && !prefs.demoMode) {
+      return;
+    }
     holder.querySelectorAll(".cx-turn-agent > .cx-cooked").forEach((cooked) => {
       const turn = cooked.closest(".cx-turn-agent");
       if (!turn || turn.dataset.sprinkled === "1") return;
@@ -5806,12 +6777,14 @@ const THINK_CLOSERS = [
       const kids = [...cooked.children];
       if (!kids.length) return;
       const rnd = mulberry32((((pid || no * 7919) + 1) * 2654435761 ^ (threadState.topicId || 0)) >>> 0);
-      // 70% 的回复楼都带英文思考块（独立于下方 runline 伪活动；判断须先于该 return 才达覆盖率）
-      if (rnd() < 0.70) {
-        cooked.prepend(buildThinking(rnd));
+      if (prefs.showThinking || prefs.demoMode) {
+        if (rnd() < 0.70) {
+          cooked.prepend(buildThinking(rnd));
+        }
       }
-      if (rnd() < 0.72) return;             // runline：大多数楼层保持素净，偶见一两条更像真的
-      const n = rnd() < 0.22 ? 2 : 1;       // 至多 2 行
+      if (!prefs.showRunlines && !prefs.demoMode) return;
+      if (rnd() < 0.72) return;
+      const n = rnd() < 0.22 ? 2 : 1;
       const used = new Set();
       for (let k = 0; k < n; k++) {
         let li = Math.floor(rnd() * RUN_LINES.length);
@@ -5820,6 +6793,7 @@ const THINK_CLOSERS = [
         const [icon, text, withCmd] = RUN_LINES[li];
         const el = document.createElement("div");
         el.className = "cx-runline";
+        el.dataset.codexDecorative = "1";
         el.innerHTML =
           (icon ? ICONS[icon] : "") +
           `<span>${text}${icon === null ? ` ${1 + Math.floor(rnd() * 4)}/${2 + Math.floor(rnd() * 4)}` : ""}</span>` +
@@ -5828,7 +6802,7 @@ const THINK_CLOSERS = [
         kids[at - 1].insertAdjacentElement("afterend", el);
         kids.splice(at, 0, el);
       }
-          });
+    });
   }
 
   /** 楼主帖 = 右上 user 气泡 + dim 元信息 */
@@ -5896,24 +6870,31 @@ const THINK_CLOSERS = [
     }
   }
 
-  async function loadTopic(topicId) {
-    if (!topicId || threadState.loading) return;
-    if (threadState.topicId === topicId) {
-      syncChrome();
+  async function loadTopic(topicId, force) {
+    if (!topicId) return;
+    const reqKey = `topic:${topicId}`;
+    if (!force && topicCoordinator.loadedKey === reqKey && threadState.topicId === topicId) {
+      syncAppChrome();
       return;
     }
+
+    const req = topicCoordinator.begin(reqKey);
     threadState.loading = true;
-    threadState.topicId = topicId;
     threadState.postsByNum = {};
     clearQuoteJumpHistory();
     ensureMain();
     showView("detail");
     const box = detailContainer();
     if (box) box.innerHTML = `<div class="cx-list-status">加载中…</div>`;
-    syncChrome();
+    syncAppChrome({ title: `话题 #${topicId}` });
+
     try {
-      const data = await api(`/t/${topicId}.json`);
-      if (threadState.topicId !== topicId) return; // 路由已切走
+      const data = await api(`/t/${topicId}.json`, undefined, req.signal);
+      if (!req.isCurrent() || !isThemeActive()) return;
+
+      threadState.topicId = topicId;
+      topicCoordinator.succeed(req.requestId, reqKey);
+
       const posts = (data.post_stream && data.post_stream.posts) || [];
       threadState.stream = (data.post_stream && data.post_stream.stream) || posts.map((p) => p.id);
       threadState.renderedFirstIdx = threadState.stream.indexOf(posts.length ? posts[0].id : -1);
@@ -5931,7 +6912,6 @@ const THINK_CLOSERS = [
       threadState.categoryId = data.category_id || null;
       threadState.postsCount = data.posts_count || posts.length;
       threadState.views = data.views || 0;
-      document.title = `${threadState.title} - Linux DO`;
 
       for (const p of posts) {
         if (p.post_number) threadState.postsByNum[p.post_number] = p;
@@ -5941,26 +6921,44 @@ const THINK_CLOSERS = [
       if (box) {
         renderTurns(box, posts, "replace");
         syncThreadDivider();
-        // 楼主在顶部，从头开始读
         const scroller = document.querySelector(".cx-view-detail");
         if (scroller) scroller.scrollTop = 0;
       }
-      syncChrome();
-      // 话题 id 是代码面板的随机种子：换帖重排一份代码
+      syncAppChrome({ title: threadState.title });
       renderCodePanel();
-      // 分类名异步到位后刷新面包屑与面板假路径
       if (!categoriesCache && threadState.categoryId) {
-        loadCategories().then(() => { syncChrome(); codePanelLastSig = ""; renderCodePanel(); });
+        loadCategories().then(() => {
+          if (req.isCurrent() && isThemeActive()) {
+            syncAppChrome({ title: threadState.title });
+            codePanelLastSig = "";
+            renderCodePanel();
+          }
+        });
       }
     } catch (err) {
+      if (err && err.name === "AbortError") return;
+      if (!req.isCurrent() || !isThemeActive()) return;
+      topicCoordinator.fail(req.requestId, reqKey, err);
       if (box) {
         box.innerHTML = `
           <div class="cx-list-status">
-            话题加载失败（${escapeHtml(err && err.message || "未知错误")}），可能无权限或已被删除
+            话题加载失败（${escapeHtml((err && err.message) || "未知错误")}），可能无权限或已被删除
+            <div style="margin-top:10px;display:flex;gap:8px;justify-content:center;">
+              <button class="cx-btn-topic-retry" style="padding:4px 12px;background:var(--cx-brand);color:#fff;border:none;border-radius:4px;cursor:pointer;">重新加载</button>
+              <button class="cx-btn-topic-native" style="padding:4px 12px;background:var(--cx-panel-header,#222);color:var(--cx-text);border:1px solid var(--cx-border,#444);border-radius:4px;cursor:pointer;">在原生界面打开</button>
+            </div>
           </div>`;
+        box.querySelector(".cx-btn-topic-retry")?.addEventListener("click", () => {
+          loadTopic(topicId, true);
+        });
+        box.querySelector(".cx-btn-topic-native")?.addEventListener("click", () => {
+          window.open(buildNativeUrl(location.href), "_blank", "noopener");
+        });
       }
     } finally {
-      threadState.loading = false;
+      if (req.isCurrent()) {
+        threadState.loading = false;
+      }
     }
   }
 
@@ -5972,13 +6970,16 @@ const THINK_CLOSERS = [
   /** 向上滚动加载更早的楼层 */
   async function loadOlderPosts() {
     if (!threadState.hasOlder || threadState.loading || !threadState.topicId) return;
+    const targetTopicId = threadState.topicId;
+    const curReqId = topicCoordinator.currentRequestId;
     const ids = threadState.stream.slice(Math.max(0, threadState.renderedFirstIdx - 20), threadState.renderedFirstIdx);
     if (!ids.length) return;
     threadState.loading = true;
     const scroller = document.querySelector(".cx-view-detail");
     try {
       const qs = ids.map((id) => `post_ids[]=${id}`).join("&");
-      const data = await api(`/t/${threadState.topicId}/posts.json?${qs}`);
+      const data = await api(`/t/${targetTopicId}/posts.json?${qs}`);
+      if (!topicCoordinator.isCurrent(curReqId) || threadState.topicId !== targetTopicId || !isThemeActive()) return;
       const posts = sortPostsByStream(
         (data.post_stream && data.post_stream.posts) || data.posts || [],
         ids
@@ -5989,7 +6990,6 @@ const THINK_CLOSERS = [
       const box = detailContainer();
       if (box && posts.length) {
         const prevHeight = scroller ? scroller.scrollHeight : 0;
-        // 旧楼层插到最前（楼主若在其中会自然成为 user 气泡）
         const holder = document.createElement("div");
         holder.innerHTML = turnsHtml(posts);
         decorateCooked(holder);
@@ -5999,13 +6999,17 @@ const THINK_CLOSERS = [
       }
       syncThreadDivider();
     } catch { /* 保留现状 */ } finally {
-      threadState.loading = false;
+      if (topicCoordinator.isCurrent(curReqId)) {
+        threadState.loading = false;
+      }
     }
   }
 
   /** 向下滚动加载更新的楼层（长帖不能只留首屏一页） */
   async function loadNewerPosts() {
     if (!threadState.hasNewer || threadState.loading || !threadState.topicId) return;
+    const targetTopicId = threadState.topicId;
+    const curReqId = topicCoordinator.currentRequestId;
     const start = threadState.renderedLastIdx + 1;
     if (start <= 0 || start >= threadState.stream.length) {
       threadState.hasNewer = false;
@@ -6019,7 +7023,8 @@ const THINK_CLOSERS = [
     threadState.loading = true;
     try {
       const qs = ids.map((id) => `post_ids[]=${id}`).join("&");
-      const data = await api(`/t/${threadState.topicId}/posts.json?${qs}`);
+      const data = await api(`/t/${targetTopicId}/posts.json?${qs}`);
+      if (!topicCoordinator.isCurrent(curReqId) || threadState.topicId !== targetTopicId || !isThemeActive()) return;
       const posts = sortPostsByStream(
         (data.post_stream && data.post_stream.posts) || data.posts || [],
         ids
@@ -6038,7 +7043,9 @@ const THINK_CLOSERS = [
       }
       syncThreadDivider();
     } catch { /* 保留现状 */ } finally {
-      threadState.loading = false;
+      if (topicCoordinator.isCurrent(curReqId)) {
+        threadState.loading = false;
+      }
     }
   }
 
@@ -6226,6 +7233,28 @@ const THINK_CLOSERS = [
     });
   }
 
+  function isEditableTarget(el) {
+    if (!el || typeof el !== "object") return false;
+    const tag = (el.tagName || "").toUpperCase();
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (el.isContentEditable) return true;
+    if (typeof el.closest === "function") {
+      if (el.closest("[contenteditable='true'], [contenteditable=''], .d-editor-input, .d-editor")) return true;
+    }
+    return false;
+  }
+
+  function shouldHandleKeyboardShortcut(e, expectedKey) {
+    if (!e) return false;
+    if (e.isComposing || e.keyCode === 229) return false;
+    if (isEditableTarget(e.target)) return false;
+    if (expectedKey) {
+      const k = (e.key || "").toLowerCase();
+      if (k !== expectedKey.toLowerCase()) return false;
+    }
+    return true;
+  }
+
   function bootstrap() {
     if (!document.documentElement) {
       setTimeout(bootstrap, 0);
@@ -6314,11 +7343,10 @@ const THINK_CLOSERS = [
     startReadTracking();
 
     // ⌘/Ctrl+K → 原生搜索
-    window.addEventListener("keydown", (e) => {      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-      if ((e.key || "").toLowerCase() !== "k") return;
+    window.addEventListener("keydown", (e) => {
+      if (!shouldHandleKeyboardShortcut(e, "k")) return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
       if (otherThemeActive()) return;
-      const tag = (e.target && e.target.tagName) || "";
-      if (tag === "TEXTAREA" || tag === "INPUT") return;
       e.preventDefault();
       e.stopPropagation();
       openNativeSearch();
@@ -6327,5 +7355,26 @@ const THINK_CLOSERS = [
     scheduleApply();
   }
 
-  bootstrap();
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+      tokenizeCode,
+      highlightCode,
+      escapeHtml,
+      RequestCoordinator,
+      buildNativeUrl,
+      shouldBypassTheme,
+      isEditableTarget,
+      shouldHandleKeyboardShortcut,
+      computeTextDiff,
+      extractThreadSnippets,
+      sanitizeWidth,
+      readPresentationPrefs,
+      getCategoryDisplayName,
+      sessionsForCat
+    };
+  }
+
+  if (typeof window !== "undefined" && typeof document !== "undefined" && !window.__CODEX_TEST_ENV__) {
+    bootstrap();
+  }
 })();

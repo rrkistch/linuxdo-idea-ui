@@ -16,15 +16,13 @@ test("T09: sanitizeWidth clamps and handles invalid inputs", () => {
   assert.strictEqual(codex.sanitizeWidth(null, def, min, max), def, "null should fallback to default");
 });
 
-test("T09: readPresentationPrefs returns safe defaults on empty or corrupt storage", () => {
-  const mockStorage = {
-    getItem: (key) => (key === "corrupt" ? "{invalid-json" : null)
-  };
-
-  const prefs = codex.readPresentationPrefs(mockStorage);
-  assert.strictEqual(prefs.showThinking, false, "Default thinking must be false");
-  assert.strictEqual(prefs.showRunlines, false, "Default runlines must be false");
-  assert.strictEqual(prefs.demoMode, false, "Default demo mode must be false");
+test("T09: presentation defaults enable activity and preserve explicit opt-outs", () => {
+  for (const raw of [null, "{invalid-json", "null", "{}"]) {
+    const prefs = codex.readPresentationPrefs({ getItem: () => raw });
+    assert.deepStrictEqual(prefs, { showThinking: true, showRunlines: true, demoMode: false });
+  }
+  assert.deepStrictEqual(codex.readPresentationPrefs({ getItem: () => '{"showThinking":false,"showRunlines":false}' }),
+    { showThinking: false, showRunlines: false, demoMode: false });
 });
 
 test("T07: Category display aliases are independent and do not mutate original object", () => {

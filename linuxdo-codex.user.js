@@ -200,7 +200,7 @@
 
   let isThemeActiveState = false;
   function isThemeActive() {
-    return isThemeActiveState;
+    return isThemeActiveState && !shouldBypassTheme();
   }
 
   let originalDocumentTitle = "";
@@ -218,7 +218,7 @@
   function restoreOriginalChrome() {
     if (typeof document === "undefined") return;
     if (originalDocumentTitle) {
-      document.title = originalDocumentTitle;
+      if (!cfBlocked() && document.title.endsWith(" · Codex")) document.title = originalDocumentTitle;
     }
     if (originalFaviconHref) {
       const icons = document.querySelectorAll("link[rel*='icon']");
@@ -246,11 +246,14 @@
    * 支持传入 env 用于单元测试：{ search, sessionStorage }
    */
   function shouldBypassTheme(env) {
-    const search = env ? env.search : (typeof location !== "undefined" ? location.search : "");
-    const session = env ? env.sessionStorage : (typeof sessionStorage !== "undefined" ? sessionStorage : null);
+    // Persist an explicit opt-out before checking temporary challenge/theme conflicts.
+    return nativeModeRequested(env) || (!env && (cfBlocked() || otherThemeActive()));
+  }
 
-    if (!env && cfBlocked()) return true;
-    if (!env && otherThemeActive()) return true;
+  function nativeModeRequested(env) {
+    const search = env ? env.search : (typeof location !== "undefined" ? location.search : "");
+    let session = null;
+    try { session = env ? env.sessionStorage : window.sessionStorage; } catch { /* unavailable */ }
 
     try {
       if (search) {
@@ -286,7 +289,7 @@
         history.replaceState(null, "", url.toString());
       } catch { /* ignore */ }
       btn.remove();
-      applyTheme();
+      bootstrap();
     });
     (document.body || document.documentElement).appendChild(btn);
   }
@@ -349,10 +352,39 @@
     isCurrent(reqId, key) {
       return reqId === this.currentRequestId && (!key || this.activeKey === key);
     }
+
+    cancel() {
+      // Advance even when abort cannot stop delivery: old callbacks/finally lose ownership.
+      this.currentRequestId++;
+      this.controller?.abort();
+      this.controller = null;
+      this.activeKey = this.loadedKey = null;
+      this.status = "idle";
+      this.lastError = null;
+    }
   }
 
   const topicCoordinator = new RequestCoordinator("topic");
   const listCoordinator = new RequestCoordinator("list");
+  const listMoreCoordinator = new RequestCoordinator("list-more");
+  const searchCoordinator = new RequestCoordinator("search");
+  let requestPage = "";
+
+  function pageRequestKey() {
+    return isSearchPath(location.pathname) ? `${location.pathname}${location.search}` : location.pathname;
+  }
+
+  function invalidatePageRequests() {
+    if (requestPage === pageRequestKey()) return;
+    requestPage = pageRequestKey();
+    listCoordinator.cancel();
+    listMoreCoordinator.cancel();
+    topicCoordinator.cancel();
+    searchCoordinator.cancel();
+    searchState.routeKey = null;
+    searchState.loading = false;
+    listState.loading = threadState.loading = false;
+  }
 
   /** 统一外壳同步：集中管理标题、favicon、面包屑与活动状态 */
   function syncAppChrome(options) {
@@ -382,12 +414,28 @@
    * 彻底清理本脚本创建的资源：class、样式、浮层、并阻止旧异步请求复活 UI
    */
   function teardownTheme() {
+    if (!isThemeActiveState) return;
     isThemeActiveState = false;
+    listCoordinator.cancel();
+    listMoreCoordinator.cancel();
+    topicCoordinator.cancel();
+    searchCoordinator.cancel();
+    searchState.routeKey = null;
+    searchState.loading = false;
+    listState.loading = threadState.loading = false;
+    listState.topics = [];
+    listState.moreUrl = null;
+    threadState.topicId = null;
+    threadState.title = "";
+    stopReadTracking();
+    faviconObserver?.disconnect();
+    faviconObserver = null;
     if (typeof document !== "undefined") {
-      document.documentElement?.classList.remove(
-        ROOT_CLASS, LOCK_CLASS, "codex-topic-open", "codex-rail-open", "codex-rail-collapsed"
-      );
+      for (const name of [ROOT_CLASS, LOCK_CLASS, "codex-light", "codex-topic-open", "codex-rail-open", "codex-rail-collapsed"]) setRootClass(name, false);
       document.getElementById(STYLE_ID)?.remove();
+      rememberCodeScroll();
+      closeWorkspaceMenu();
+      cxClosePop();
       document.querySelector(".codex-main")?.remove();
       document.querySelector(".codex-rail")?.remove();
       closeLightbox();
@@ -724,11 +772,17 @@
     preview: "实时预览"
   };
   function cxComposerToolbarHtml() {
-    const seq = ["bold", "italic", "heading", "strike", "link", "quote", "code", "listUl", "listOl", "folder", "emoji", "plus", "preview"];
-    return seq.map((k) =>
-      `<button type="button" class="cx-tool-btn" data-tool="${k}" title="${CX_TOOL_TITLES[k]}"${k === "folder" ? ` data-upload="1"` : ""}>${CX_EDITOR_ICONS[k]}</button>`
-    ).join("") + `<span class="cx-composer-status"></span>` +
-      `<button type="button" class="codex-composer-send" title="发送（Enter）" disabled>${ICONS.send}</button>`;
+    const button = (k) => `<button type="button" class="cx-tool-btn" data-tool="${k}" aria-label="${CX_TOOL_TITLES[k]}" title="${CX_TOOL_TITLES[k]}"${k === "folder" ? ` data-upload="1"` : ""}>${CX_EDITOR_ICONS[k]}</button>`;
+    return `<div class="cx-composer-format-tools" id="cx-composer-format-tools" role="group" aria-label="Markdown 格式工具" hidden>
+        ${["bold", "italic", "heading", "strike", "link", "quote", "code", "listUl", "listOl", "emoji", "plus"].map(button).join("")}
+      </div>
+      <div class="cx-composer-controls">
+        ${button("folder")}
+        <button type="button" class="cx-format-toggle" title="格式工具" aria-label="格式工具" aria-expanded="false" aria-controls="cx-composer-format-tools">Aa</button>
+        <span class="cx-composer-context">${ICONS.reply}<span>回复话题</span></span>
+        ${button("preview")}
+        <button type="button" class="codex-composer-send" aria-label="发送" title="发送（Enter）；Shift+Enter 换行" disabled>${ICONS.send}</button>
+      </div><span class="cx-composer-status" role="status"></span>`;
   }
 
   /* ---- 块级编辑器核心（聚焦块显示原文，其余块实时渲染） ---- */
@@ -973,7 +1027,7 @@
   function cxOpenPop(btn, className, html) {
     cxClosePop();
     cxPopEl = document.createElement("div");
-    cxPopEl.className = className;
+    cxPopEl.className = `cx-md-pop ${className}`;
     cxPopEl.innerHTML = html;
     document.body.appendChild(cxPopEl);
     const rect = btn.getBoundingClientRect();
@@ -1390,6 +1444,22 @@
     });
 
     // 工具栏：folder 走文件选择，其余按 data-tool 分发
+    const formatToggle = card.querySelector(".cx-format-toggle");
+    const formatTools = card.querySelector(".cx-composer-format-tools");
+    const setFormatOpen = (open) => {
+      if (!open) cxClosePop();
+      formatTools.hidden = !open;
+      formatToggle.setAttribute("aria-expanded", String(open));
+    };
+    formatToggle.addEventListener("mousedown", (e) => e.preventDefault());
+    formatToggle.addEventListener("click", () => setFormatOpen(formatTools.hidden));
+    card.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !formatTools.hidden) {
+        e.preventDefault();
+        if (formatTools.contains(document.activeElement)) formatToggle.focus();
+        setFormatOpen(false);
+      }
+    });
     for (const btn of card.querySelectorAll(".cx-tool-btn")) {
       const kind = btn.dataset.tool;
       btn.addEventListener("mousedown", (e) => e.preventDefault());
@@ -1555,6 +1625,10 @@
     return /^\/t\//.test(pathname);
   }
 
+  function isSearchPath(pathname) {
+    return /^\/search\/?$/.test(pathname);
+  }
+
   function topicIdFromPath(pathname) {
     const m = pathname.match(/^\/t\/(?:[\w-]+\/)?(\d+)/);
     return m ? Number(m[1]) : null;
@@ -1636,13 +1710,13 @@
   const RAW_CSS = String.raw`
     /* ---------- Token：深色（默认） ---------- */
     .${ROOT_CLASS} {
-      /* 左栏深青灰蓝（用户提供截图实测 #27353b），hover/active 为同色系亮阶 */
-      --cx-rail-bg: #27353b;
-      --cx-rail-bg-hover: #2e3d44;
-      --cx-rail-bg-active: #35454d;
+      /* 左栏与工作区共用中性灰阶 */
+      --cx-rail-bg: #181818;
+      --cx-rail-bg-hover: #242424;
+      --cx-rail-bg-active: #303030;
       --cx-rail-text: #dedede;
-      --cx-rail-text-dim: #96a0a4;
-      --cx-rail-text-faint: #6c787d;
+      --cx-rail-text-dim: #969696;
+      --cx-rail-text-faint: #787878;
       --cx-rail-border: rgba(255, 255, 255, 0.06);
 
       --cx-bg: #181818;
@@ -1667,7 +1741,7 @@
       --cx-btn-hover: #333333;
       --cx-wash: rgba(255, 255, 255, 0.03);
       --cx-scroll-thumb: rgba(255, 255, 255, 0.12);
-      --cx-send-bg: #8a8a8a;
+      --cx-send-bg: #ececec;
       --cx-send-icon: #1f1f1f;
 
       --cx-code-text: #cfcfcf;
@@ -1697,12 +1771,12 @@
 
     /* ---------- Token：浅色 ---------- */
     .${ROOT_CLASS}.codex-light {
-      --cx-rail-bg: #e7edee;
-      --cx-rail-bg-hover: #dde4e6;
-      --cx-rail-bg-active: #d2dbdd;
-      --cx-rail-text: #2c3438;
-      --cx-rail-text-dim: #6e6f72;
-      --cx-rail-text-faint: #97989a;
+      --cx-rail-bg: #ededed;
+      --cx-rail-bg-hover: #e3e3e3;
+      --cx-rail-bg-active: #d8d8d8;
+      --cx-rail-text: #303030;
+      --cx-rail-text-dim: #6e6e6e;
+      --cx-rail-text-faint: #858585;
       --cx-rail-border: rgba(0, 0, 0, 0.07);
 
       --cx-bg: #f4f4f4;
@@ -1747,14 +1821,6 @@
       --cx-diff-hunk-tx: #46769e;
     }
 
-      --cx-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
-        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-      --cx-font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
-        "Liberation Mono", monospace;
-
-      --cx-rail-w: ${RAIL_WIDTH}px;
-      --cx-radius: 10px;
-    }
 
     /* ---------- 自绘 UI 统一盒模型 ---------- */
     .codex-rail, .codex-rail *,
@@ -1805,6 +1871,37 @@
       pointer-events: none !important;
       padding-top: 0 !important;
     }
+
+    .${ROOT_CLASS}.${LOCK_CLASS} .sidebar-wrapper,
+    .${ROOT_CLASS}.${LOCK_CLASS} .sidebar-container { display: none !important; }
+
+    .cx-search-heading { display:flex; align-items:center; gap:14px; margin:8px 0 28px; }
+    .cx-search-heading > span { display:grid; place-items:center; width:42px; height:42px; border:1px solid var(--cx-border); border-radius:12px; }
+    .cx-search-heading svg { width:20px; height:20px; }
+    .cx-search-heading h1 { font-size:21px; margin:0 0 5px; font-weight:600; }
+    .cx-search-heading p { font-size:12px; color:var(--cx-text-dim); margin:0; }
+    .cx-search-heading kbd { margin-left:auto; color:var(--cx-text-dim); font:11px var(--cx-font-mono); white-space:nowrap; }
+    .cx-search-field { display:flex; gap:8px; }
+    .cx-search-form input, .cx-search-form select { min-width:0; width:100%; border:1px solid var(--cx-border-strong); border-radius:7px; background:var(--cx-bg-inset); color:var(--cx-text); padding:9px 10px; font:inherit; }
+    .cx-search-form .cx-search-input { flex:1; width:0; padding:12px; }
+    .cx-search-submit, .cx-search-status button { border:1px solid var(--cx-border-strong); border-radius:7px; padding:8px 15px; background:var(--cx-chip-bg); color:var(--cx-text); cursor:pointer; flex:none; }
+    .cx-search-status button:disabled { opacity:.55; cursor:wait; }
+    .cx-search-filters { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:14px 0 24px; }
+    .cx-search-filters label { font-size:11px; color:var(--cx-text-dim); display:flex; flex-direction:column; gap:6px; min-width:0; }
+    .cx-search-tabs { display:flex; gap:18px; border-bottom:1px solid var(--cx-border); }
+    .cx-search-tabs button { font:inherit; font-size:12px; border:0; border-bottom:2px solid transparent; padding:10px 0; background:transparent; color:var(--cx-text-dim); cursor:pointer; }
+    .cx-search-tabs .cx-on { color:var(--cx-text); border-bottom-color:var(--cx-blue); }
+    .cx-search-result { display:flex; gap:12px; padding:20px 0; border-bottom:1px solid var(--cx-border-soft); color:var(--cx-text); text-decoration:none; }
+    .cx-search-result:hover { background:var(--cx-wash); }
+    .cx-search-result svg { width:15px; height:15px; flex:none; color:var(--cx-text-dim); }
+    .cx-search-result-icon { padding-top:2px; }
+    .cx-search-result-content { flex:1; min-width:0; display:flex; flex-direction:column; gap:8px; overflow-wrap:anywhere; }
+    .cx-search-result strong { font-weight:500; font-size:14px; color:var(--cx-text); }
+    .cx-search-excerpt { font-size:12px; line-height:1.7; color:var(--cx-text-secondary); }
+    .cx-search-meta { color:var(--cx-text-dim); font:11px var(--cx-font-mono); }
+    .cx-search-status { padding:24px 4px; color:var(--cx-text-dim); font-size:12px; line-height:1.7; }
+    .codex-main button:focus-visible, .codex-main a:focus-visible, .codex-main input:focus-visible, .codex-main select:focus-visible { outline:2px solid var(--cx-blue); outline-offset:2px; }
+    @media (max-width:500px) { .cx-search-filters { grid-template-columns:1fr; } .cx-search-heading kbd { display:none; } }
 
     /* 底部聊天抽屉等会破坏观感，隐藏 */
     .${ROOT_CLASS} .chat-drawer-container,
@@ -2576,57 +2673,63 @@
     }
     .cx-worked:hover { opacity: 0.9; }
     .cx-worked svg { width: 14px; height: 14px; flex: none; }
+    .cx-worked, .cx-turn-meta { flex-wrap: wrap; row-gap: 6px; }
 
-    /* 楼内穿插的 agent 活动 / 思考行（装饰） */
-    .cx-runline {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin: 12px 0;
-      font-size: 12.5px;
+    /* 折叠活动独立于原始正文；默认静止，展开后才占据空间 */
+    .cx-turn-activity {
+      margin: 0 0 16px;
       color: var(--cx-text-dim);
-    }
-    .cx-runline svg { width: 14px; height: 14px; flex: none; color: var(--cx-text-faint); }
-    .cx-runline code {
-      font-family: var(--cx-font-mono);
-      font-size: 11.5px;
-      color: var(--cx-chip-text);
-      background: var(--cx-chip-bg);
-      border-radius: 6px;
-      padding: 1.5px 7px;
-    }
-    /* 楼内 agent 英文思考块（参考 cli 皮肤：可折叠，默认展开） */
-    .cx-think {
-      margin: 10px 0;
       font-size: 12.5px;
-      color: var(--cx-text-dim);
-    }
-    .cx-think-head {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      cursor: pointer;
+      line-height: 1.6;
       user-select: none;
     }
-    .cx-think-head:hover { color: var(--cx-text-secondary); }
-    .cx-think-head .spin { color: var(--cx-blue); }
-    .cx-think-chev { font-size: 10px; }
-    .cx-think-body {
-      display: none;
-      margin: 7px 0 2px;
-      line-height: 1.7;
-      color: var(--cx-text-secondary);
-      border-left: 1px solid var(--cx-border-soft);
-      padding-left: 10px;
-      white-space: pre-wrap;
+    .cx-turn-activity details + details { margin-top: 4px; }
+    .cx-turn-activity summary {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      width: fit-content;
+      max-width: 100%;
+      min-height: 28px;
+      list-style: none;
+      cursor: pointer;
+      border-radius: 5px;
     }
-    .cx-think.open .cx-think-body { display: block; }
-    .cx-think.open .cx-think-chev::after { content: "▾"; }
-    .cx-think:not(.open) .cx-think-chev::after { content: "▸"; }
+    .cx-turn-activity summary::-webkit-details-marker { display: none; }
+    .cx-turn-activity summary:hover { color: var(--cx-text); }
+    .cx-turn-activity summary:focus-visible { outline: 2px solid var(--cx-blue); outline-offset: 3px; }
+    .cx-activity-chevron { display: flex; flex: none; }
+    .cx-activity-chevron svg { width: 13px; height: 13px; }
+    .cx-turn-activity details[open] > summary .cx-activity-chevron { transform: rotate(90deg); }
+    .cx-think-body, .cx-tools-body {
+      margin: 6px 0 10px 6px;
+      padding: 4px 0 4px 14px;
+      border-left: 1px solid var(--cx-border-strong);
+      color: var(--cx-text-secondary);
+      overflow-wrap: anywhere;
+    }
+    .cx-think-body { white-space: pre-wrap; line-height: 1.8; }
+    .cx-runline + .cx-runline { margin-top: 12px; }
+    .cx-runline-label { display: flex; align-items: center; gap: 7px; }
+    .cx-runline-label span { min-width: 0; overflow-wrap: anywhere; }
+    .cx-runline-label svg { width: 13px; height: 13px; flex: none; color: var(--cx-text-dim); }
+    .cx-runline-label svg:last-child { margin-left: auto; }
+    .cx-runline pre {
+      margin: 6px 0 0;
+      padding: 8px 10px;
+      background: var(--cx-bg-inset);
+      border: 1px solid var(--cx-border-soft);
+      border-radius: 7px;
+      font: 11.5px/1.65 var(--cx-font-mono);
+      color: var(--cx-text-dim);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
 
     /* 每楼底部操作行 */
     .cx-turn-actions {
       display: flex;
+      flex-shrink: 0;
       align-items: center;
       gap: 4px;
       margin: 0 0 0 auto; /* 与楼层信息同行，靠右 */
@@ -2635,8 +2738,10 @@
     }
     .cx-turn-agent:hover + .cx-worked .cx-turn-actions,
     .cx-worked:hover .cx-turn-actions,
+    .cx-worked:focus-within .cx-turn-actions,
     .cx-turn-user:hover + .cx-turn-meta .cx-turn-actions,
     .cx-turn-meta:hover .cx-turn-actions,
+    .cx-turn-meta:focus-within .cx-turn-actions,
     .cx-turn-actions.cx-has-liked { opacity: 1; }
     .cx-act {
       display: inline-flex;
@@ -2658,17 +2763,19 @@
     /* —— 底部 composer（嵌入 im 式 markdown 输入框，工具栏置于下方） —— */
     .codex-composer-wrap {
       flex: none;
-      padding: 8px 16px 14px;
+      padding: 12px 20px 18px;
     }
     .codex-composer {
       width: 100%;
-      max-width: 600px; /* 收起代码面板时的宽度 */
+      max-width: 800px;
       margin: 0 auto;
       background: var(--cx-composer-bg);
       border: 1px solid var(--cx-border);
-      border-radius: 16px;
-      padding: 10px 12px 8px;
+      border-radius: 20px;
+      padding: 14px 16px 10px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
     }
+    .codex-composer:focus-within { border-color: var(--cx-border-strong); }
 
     /* 输入区：contenteditable，Typora 式块级渐进渲染 */
     .cx-md-edit {
@@ -2676,7 +2783,7 @@
       font-family: var(--cx-font-ui);
       font-size: 14px;
       line-height: 1.65;
-      min-height: 48px;
+      min-height: 64px;
       max-height: 220px;
       overflow-y: auto;
       outline: none;
@@ -2688,7 +2795,7 @@
     .cx-md-edit:not(.has-content)::before {
       content: attr(data-placeholder);
       position: absolute;
-      color: var(--cx-text-faint);
+      color: var(--cx-text-dim);
       pointer-events: none;
     }
     .cx-md-block { min-height: 1.5em; }
@@ -2772,17 +2879,25 @@
     .cx-compose-target button:hover { color: var(--cx-text); }
 
     /* 工具栏（输入框下方） */
-    .cx-composer-toolbar {
+    .cx-composer-controls {
       display: flex;
       align-items: center;
-      gap: 2px;
-      padding-top: 8px;
-      margin-top: 6px;
-      border-top: 1px solid var(--cx-border-soft);
+      gap: 6px;
+      padding-top: 6px;
     }
-    .cx-composer-toolbar .cx-tool-btn {
-      width: 28px; height: 28px;
-      border-radius: 6px;
+    .cx-composer-format-tools {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      padding: 8px 0;
+      margin-bottom: 2px;
+      border-top: 1px solid var(--cx-border-soft);
+      border-bottom: 1px solid var(--cx-border-soft);
+    }
+    .cx-composer-format-tools[hidden] { display: none; }
+    .cx-composer-toolbar .cx-tool-btn, .cx-format-toggle {
+      width: 32px; height: 32px;
+      border-radius: 8px;
       display: grid; place-items: center;
       border: none; background: none;
       color: var(--cx-text-dim);
@@ -2790,26 +2905,38 @@
       font-family: var(--cx-font-ui);
       flex: none;
     }
-    .cx-composer-toolbar .cx-tool-btn:hover { background: var(--cx-btn-hover); color: var(--cx-text); }
+    .cx-composer-toolbar .cx-tool-btn:hover, .cx-format-toggle:hover,
+    .cx-format-toggle[aria-expanded="true"] { background: var(--cx-btn-hover); color: var(--cx-text); }
+    .cx-composer-toolbar button:focus-visible { outline: 2px solid var(--cx-blue); outline-offset: 2px; }
+    .cx-format-toggle { font-size: 15px; letter-spacing: -0.6px; }
     .cx-composer-toolbar .cx-tool-btn svg { width: 16px; height: 16px; }
     .cx-composer-toolbar .cx-tool-btn.active { color: var(--cx-blue); }
+    .cx-composer-context {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      flex: none;
+      font-size: 12px;
+      color: var(--cx-text-dim);
+      padding-left: 5px;
+      margin-right: auto;
+    }
+    .cx-composer-context svg { width: 13px; height: 13px; }
     .cx-composer-status {
-      flex: 1;
-      min-height: 16px;
+      display: block;
       font-size: 12px;
       color: var(--cx-text-faint);
-      margin: 0 8px;
-      text-align: right;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      margin: 6px 2px 0;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
+    .cx-composer-status:empty { display: none; }
     .cx-composer-status.cx-busy { color: var(--cx-blue); }
     .cx-composer-status.cx-ok { color: #52b36b; }
     .cx-composer-status.cx-err { color: #e0626a; }
     .codex-composer-send {
       flex: none;
-      width: 30px; height: 30px;
+      width: 34px; height: 34px;
       border-radius: 50%;
       background: var(--cx-send-bg);
       color: var(--cx-send-icon);
@@ -2818,8 +2945,17 @@
       place-items: center;
       cursor: pointer;
     }
-    .codex-composer-send svg { width: 15px; height: 15px; }
+    .codex-composer-send svg { width: 18px; height: 18px; }
     .codex-composer-send:disabled { opacity: 0.45; cursor: default; }
+    @media (max-width: 600px) {
+      .codex-composer-wrap { padding: 8px 10px 12px; }
+      .codex-composer { padding: 12px 12px 8px; border-radius: 18px; }
+      .cx-composer-context { gap: 4px; padding-left: 0; }
+      .cx-composer-controls { gap: 4px; }
+      .cx-composer-toolbar .cx-tool-btn, .cx-format-toggle { width: 36px; height: 36px; }
+      .cx-turn-activity summary { min-height: 36px; }
+      .cx-turn-actions { opacity: 1; }
+    }
 
     /* 表情 / 更多弹层 */
     .cx-md-pop {
@@ -2862,9 +2998,6 @@
     }
     .cx-plus-item .ico { width: 16px; text-align: center; }
     .cx-plus-item:hover { background: var(--cx-btn-hover); color: var(--cx-text); }
-
-    /* 代码面板展开时再收一档（原版输入框随分屏变窄） */
-    .${ROOT_CLASS}:not(.codex-hide-code-panel) .codex-composer { max-width: 500px; }
 
     /* ================= 分屏：右侧代码面板（纯氛围，列表/详情共享同一实例） ================= */
     /* 内容区横排：左 = 当前视图滚动容器，右 = 共享代码面板 */
@@ -2985,13 +3118,13 @@
       padding: 2px;
       font-size: 11px;
     }
-    .cx-code-view-toggle span {
+    .cx-code-view-toggle button {
       padding: 3px 10px;
       border-radius: 999px;
       cursor: pointer;
       color: var(--cx-text-dim);
     }
-    .cx-code-view-toggle span.cx-on { background: var(--cx-bg-raised); color: var(--cx-text); }
+    .cx-code-view-toggle button.cx-on { background: var(--cx-bg-raised); color: var(--cx-text); }
     .cx-open-btn {
       display: flex;
       align-items: center;
@@ -3005,7 +3138,43 @@
       cursor: pointer;
       font-family: var(--cx-font-ui);
     }
-    /* 「打开」= 语言下拉入口 */
+    .cx-code-panel { position:relative; min-width:0; }
+    .cx-workspace-bar { display:flex; align-items:center; gap:12px; height:43px; flex:none; padding:0 12px; border-bottom:1px solid var(--cx-border-soft); }
+    .cx-workspace-bar button { display:flex; align-items:center; gap:7px; border:0; padding:4px 0; background:transparent; color:var(--cx-text-secondary); cursor:pointer; min-width:0; font:12px var(--cx-font-mono); }
+    .cx-workspace-bar [data-workspace-menu] { flex:1; }
+    .cx-workspace-bar [data-workspace-name] { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .cx-workspace-bar svg { width:14px; height:14px; flex:none; }
+    .cx-workspace-branch { display:flex; align-items:center; gap:5px; font:11px var(--cx-font-mono); color:var(--cx-text-dim); }
+    .cx-file-tabs { display:flex; align-items:flex-end; min-width:0; flex:1; overflow-x:auto; height:100%; scrollbar-width:none; }
+    .cx-file-tabs .cx-code-tab { background:transparent; border-radius:0; border-bottom:1px solid transparent; padding:0 9px; gap:8px; flex:none; }
+    .cx-file-tabs .cx-code-tab::before, .cx-file-tabs .cx-code-tab::after { display:none; }
+    .cx-file-tabs .cx-active { background:var(--cx-panel-bg); border-bottom-color:var(--cx-blue); }
+    .cx-file-tabs button, .cx-file-add { color:var(--cx-text-dim); background:transparent; border:0; padding:4px 0; font:11px var(--cx-font-mono); cursor:pointer; white-space:nowrap; }
+    .cx-file-tabs .cx-active [data-select-file] { color:var(--cx-text); }
+    .cx-file-tabs [data-close-file] { font-size:15px; padding:4px; }
+    .cx-file-add { align-self:center; padding:6px; flex:none; display:grid; place-items:center; }
+    .cx-file-add svg { width:14px; height:14px; }
+    .cx-code-crumb { min-width:0; }
+    .cx-code-crumb .cx-crumbs { display:flex; align-items:center; gap:7px; flex:1; overflow:hidden; white-space:nowrap; min-width:0; font-size:11px; }
+    .cx-code-crumb [data-code-crumb-dir] { overflow:hidden; text-overflow:ellipsis; }
+    .cx-code-view-toggle { flex:none; }
+    .cx-code-view-toggle button { background:transparent; border:0; color:var(--cx-text-dim); cursor:pointer; font:11px var(--cx-font-ui); }
+    .cx-code-view-toggle button:disabled { opacity:.4; cursor:default; }
+    .cx-code-status { display:flex; justify-content:space-between; gap:8px; flex:none; padding:6px 12px; font:10px var(--cx-font-mono); color:var(--cx-text-dim); border-top:1px solid var(--cx-border-soft); }
+    .cx-workspace-picker { position:absolute; left:10px; right:10px; top:42px; z-index:10; background:var(--cx-bg-raised); border:1px solid var(--cx-border-strong); box-shadow:0 12px 30px #0004; border-radius:9px; padding:6px; max-height:65%; overflow:auto; }
+    .cx-picker-label { color:var(--cx-text-dim); font-size:11px; padding:7px 9px; }
+    .cx-workspace-picker button { display:flex; justify-content:space-between; align-items:center; gap:12px; text-align:left; width:100%; color:var(--cx-text); background:none; border:0; border-radius:5px; padding:9px; cursor:pointer; font:12px var(--cx-font-mono); }
+    .cx-workspace-picker button span { overflow-wrap:anywhere; }
+    .cx-workspace-picker button:hover, .cx-workspace-picker button[aria-pressed="true"] { background:var(--cx-wash); }
+    .cx-workspace-picker small { color:var(--cx-text-dim); font-size:10px; }
+    .cx-snippet-actions { display:flex; align-items:center; gap:10px; padding:8px 12px; font-size:11px; color:var(--cx-text-dim); border-bottom:1px solid var(--cx-border-soft); }
+    .cx-snippet-actions[hidden] { display:none; }
+    .cx-snippet-actions span { margin-right:auto; }
+    .cx-snippet-actions button { background:none; color:var(--cx-text); border:1px solid var(--cx-border); border-radius:4px; padding:3px 6px; cursor:pointer; font:inherit; }
+    .cx-code-empty { padding:32px 20px; color:var(--cx-text-dim); font:12px var(--cx-font-ui); }
+    .cx-diff-summary { padding:8px 18px 14px; font-size:11px; color:var(--cx-text-dim); }
+
+    /* 通用下拉按钮 */
     .cx-open-btn { gap: 5px; font-weight: 500; }
     .cx-open-btn .cx-chev { width: 11px; height: 11px; opacity: 0.75; }
     .cx-lang-menu {
@@ -3245,8 +3414,7 @@
       style.id = STYLE_ID;
       (document.head || document.documentElement).appendChild(style);
     }
-    // 始终刷新，避免旧版 CSS 残留
-    style.textContent = RAW_CSS;
+    if (style.textContent !== RAW_CSS) style.textContent = RAW_CSS;
   }
 
   let faviconObserver = null;
@@ -3254,7 +3422,7 @@
 
   function makeFavicon() {
     const head = document.head;
-    if (!head || faviconApplying) return;
+    if (!head || faviconApplying || !isThemeActive()) return;
     faviconApplying = true;
     try {
       const href = makeCodexFaviconUri();
@@ -4105,18 +4273,18 @@
   function readPresentationPrefs(customStorage) {
     const storage = customStorage || (typeof localStorage !== "undefined" ? localStorage : null);
     const defaults = {
-      showThinking: false,
-      showRunlines: false,
+      showThinking: true,
+      showRunlines: true,
       demoMode: false
     };
     if (!storage) return defaults;
     try {
-      const raw = storage.getItem(PRESENTATION_PREFS_KEY) || (typeof storage.getItem === "function" && storage.getItem("corrupt"));
+      const raw = storage.getItem(PRESENTATION_PREFS_KEY);
       if (!raw) return defaults;
       const parsed = JSON.parse(raw);
       return {
-        showThinking: Boolean(parsed.showThinking),
-        showRunlines: Boolean(parsed.showRunlines),
+        showThinking: typeof parsed.showThinking === "boolean" ? parsed.showThinking : defaults.showThinking,
+        showRunlines: typeof parsed.showRunlines === "boolean" ? parsed.showRunlines : defaults.showRunlines,
         demoMode: Boolean(parsed.demoMode)
       };
     } catch {
@@ -4458,21 +4626,188 @@
     rail.querySelector('[data-nav="activity"]')?.classList.toggle("active", path.startsWith("/my"));
   }
 
-  /** 搜索图标：优先打开原生搜索面板，失败退回 /search 页 */
+  /** 搜索入口共享工作区；焦点在视图创建后移入。 */
+  let focusSearchOnOpen = false;
   function openNativeSearch() {
-    try {
-      const btn = document.querySelector(
-        "#search-button, .d-header .search-dropdown button, .d-header li.search-dropdown .icon, button.search-dropdown"
-      );
-      if (btn) {
-        btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-        return;
-      }
-    } catch { /* ignore */ }
-    navigateInApp("/search");
+    focusSearchOnOpen = true;
+    if (isSearchPath(location.pathname)) scheduleApply();
+    else navigateInApp("/search");
   }
 
   /* ============================== 主区骨架与顶栏 ============================== */
+
+  const searchState = { routeKey: null, query: "", type: "posts", page: 0, items: [], more: false, loading: false, error: "", retryPage: 1 };
+
+  function searchRoute() {
+    const params = new URLSearchParams(location.search);
+    return { query: (params.get("q") || "").trim(), type: ["taxonomy", "users"].includes(params.get("type")) ? params.get("type") : "posts" };
+  }
+
+  function searchViewHtml() {
+    return `<section class="codex-thread cx-view-search" style="display:none" aria-label="搜索工作区">
+      <div class="codex-thread-inner">
+        <div class="cx-search-heading"><span>${ICONS.search}</span><div><h1>搜索工作区</h1><p>查找话题、分类、标签和成员</p></div><kbd>Ctrl K</kbd></div>
+        <form class="cx-search-form" role="search">
+          <div class="cx-search-field"><input class="cx-search-input" type="search" aria-label="搜索关键词" placeholder="搜索… 支持 in:title、after: 等指令" autocomplete="off"><button class="cx-search-submit" type="submit">搜索</button></div>
+          <div class="cx-search-filters">
+            <label>排序<select name="order"><option value="">相关性</option><option value="latest">最新回复</option><option value="latest_topic">最新主题</option><option value="likes">最多点赞</option><option value="views">最多浏览</option></select></label>
+            <label>分类<input name="category" placeholder="全部分类" aria-label="分类筛选"></label>
+            <label>作者<input name="author" placeholder="所有作者" aria-label="作者筛选"></label>
+          </div>
+        </form>
+        <div class="cx-search-tabs" role="tablist" aria-label="搜索类型">
+          <button role="tab" data-search-type="posts">帖子</button><button role="tab" data-search-type="taxonomy">分类与标签</button><button role="tab" data-search-type="users">用户</button>
+        </div>
+        <div class="cx-search-results" aria-label="搜索结果"></div>
+        <div class="cx-search-status" role="status" aria-live="polite"></div>
+      </div>
+    </section>`;
+  }
+
+  function searchQueryFromForm(form) {
+    let query = form.querySelector(".cx-search-input").value.trim();
+    for (const [name, token] of [["order", "order"], ["category", "category"], ["author", "user"]]) {
+      const field = form.elements[name];
+      const value = field.value.trim().replace(/^@/, "");
+      if (!value && !field.dataset.original) continue;
+      query = query.replace(new RegExp(`(?:^|\\s)${token}:(?:"[^"]*"|\\S+)`, "g"), " ").trim();
+      if (value) query += ` ${token}:${/\s/.test(value) ? JSON.stringify(value) : value}`;
+    }
+    return query.trim();
+  }
+
+  function navigateSearch(query, type) {
+    const params = new URLSearchParams();
+    if (query) params.set("q", query);
+    if (type !== "posts") params.set("type", type);
+    const url = `/search${params.size ? `?${params}` : ""}`;
+    if (location.pathname + location.search === url) loadSearchPage(1, true);
+    else navigateInApp(url);
+  }
+
+  function bindSearchEvents(main) {
+    const form = main.querySelector(".cx-search-form");
+    let composing = false;
+    form.addEventListener("compositionstart", () => { composing = true; });
+    form.addEventListener("compositionend", () => { composing = false; });
+    form.addEventListener("keydown", e => {
+      if (e.key === "Enter" && (composing || e.isComposing || e.keyCode === 229)) e.preventDefault();
+    });
+    form.addEventListener("submit", e => {
+      e.preventDefault();
+      if (!composing) navigateSearch(searchQueryFromForm(form), searchRoute().type);
+    });
+    main.querySelector(".cx-view-search").addEventListener("click", e => {
+      const tab = e.target.closest("[data-search-type]");
+      if (tab) navigateSearch(searchQueryFromForm(form), tab.dataset.searchType);
+      if (e.target.closest(".cx-search-more")) loadSearchPage(searchState.page + 1);
+      if (e.target.closest(".cx-search-retry")) loadSearchPage(searchState.retryPage, true);
+    });
+  }
+
+  function syncSearchView() {
+    const form = document.querySelector(".cx-search-form");
+    const key = pageRequestKey();
+    if (searchState.routeKey !== key) {
+      Object.assign(searchState, searchRoute(), { routeKey: key, page: 0, items: [], more: false, error: "", loading: false });
+      form.querySelector(".cx-search-input").value = searchState.query;
+      for (const [name, token] of [["order", "order"], ["category", "category"], ["author", "user"]]) {
+        const match = new RegExp(`(?:^|\\s)${token}:("[^"]*"|\\S+)`).exec(searchState.query);
+        const value = (match?.[1] || "").replace(/^"|"$/g, "");
+        form.elements[name].value = value;
+        form.elements[name].dataset.original = value;
+      }
+      document.querySelectorAll("[data-search-type]").forEach(el => {
+        const active = el.dataset.searchType === searchState.type;
+        el.classList.toggle("cx-on", active);
+        el.setAttribute("aria-selected", String(active));
+      });
+      renderSearchResults();
+      syncAppChrome({ title: searchState.query ? `搜索 · ${searchState.query}` : "搜索" });
+      if (searchState.query) loadSearchPage(1);
+    }
+    if (focusSearchOnOpen) {
+      focusSearchOnOpen = false;
+      form.querySelector(".cx-search-input").focus();
+    }
+  }
+
+  function searchText(value) {
+    const text = document.createElement("textarea");
+    text.innerHTML = String(value || "").replace(/<[^>]*>/g, "");
+    return text.value;
+  }
+
+  function searchItems(data, type) {
+    if (type === "users") return (data.users || []).map(u => ({ id: `user:${u.username}`, title: u.username, excerpt: u.name || "", meta: "成员", href: `/u/${encodeURIComponent(u.username)}` }));
+    if (type === "taxonomy") return [
+      ...(data.categories || []).map(c => ({ id: `category:${c.id}`, title: c.name, excerpt: searchText(c.description_text), meta: "分类", href: `/c/${encodeURIComponent(c.slug || c.id)}/${c.id}` })),
+      ...(data.tags || []).map(t => {
+        const name = typeof t === "string" ? t : t.name || t.id;
+        const slug = typeof t === "string" ? t : t.slug || name;
+        const tagId = /^(\d+)-tag$/.exec(slug)?.[1];
+        return { id: `tag:${slug}`, title: `#${name}`, excerpt: "", meta: "标签", href: `/tag/${encodeURIComponent(slug)}${tagId ? `/${tagId}` : ""}` };
+      })
+    ];
+    const topics = new Map((data.topics || []).map(t => [t.id, t]));
+    return (data.posts || []).map(p => {
+      const t = topics.get(p.topic_id) || {};
+      return { id: `post:${p.id}`, title: searchText(t.title || p.topic_title_headline || t.fancy_title), excerpt: searchText(p.blurb), meta: [p.username && `@${p.username}`, p.post_number && `#${p.post_number}`, formatTime(p.created_at)].filter(Boolean).join(" · "), href: `/t/${encodeURIComponent(t.slug || "topic")}/${p.topic_id}${p.post_number > 1 ? `/${p.post_number}` : ""}` };
+    });
+  }
+
+  function renderSearchResults() {
+    const box = document.querySelector(".cx-search-results");
+    const status = document.querySelector(".cx-search-status");
+    if (!box || !status) return;
+    box.setAttribute("aria-busy", String(searchState.loading));
+    box.innerHTML = searchState.items.map(item => `<a class="cx-search-result" href="${escapeHtml(item.href)}"><span class="cx-search-result-icon">${ICONS.file}</span><span class="cx-search-result-content"><strong>${escapeHtml(item.title)}</strong><span class="cx-search-excerpt">${escapeHtml(item.excerpt)}</span><span class="cx-search-meta">${escapeHtml(item.meta)}</span></span>${ICONS.chevronRightSm}</a>`).join("");
+    status.innerHTML = searchState.loading ? "搜索中…" : searchState.error
+      ? `${escapeHtml(searchState.error)} <button class="cx-search-retry">重试</button>`
+      : !searchState.query ? "输入关键词开始搜索，可使用站点高级查询指令。"
+      : !searchState.items.length ? "没有匹配结果，试试更简短的关键词或放宽筛选条件。"
+      : searchState.more ? `<button class="cx-search-more">加载更多</button>`
+      : `已显示 ${searchState.items.length} 条结果${searchState.page >= 10 ? " · 请缩小搜索范围以查找更多内容" : ""}`;
+    // Keep a disabled pagination control while a page is pending, including late finally tests.
+    if (searchState.loading && searchState.page) status.innerHTML += `<button class="cx-search-more" disabled>加载中…</button>`;
+  }
+
+  async function loadSearchPage(page, force = false) {
+    if (!isThemeActive() || !isSearchPath(location.pathname) || !searchState.query || page > 10) return;
+    if (searchState.loading && !force) return;
+    const owner = pageRequestKey();
+    const { query, type } = searchState;
+    const key = JSON.stringify([query, type, page]);
+    const req = searchCoordinator.begin(key);
+    const current = () => req.isCurrent() && isThemeActive() && isSearchPath(location.pathname) && pageRequestKey() === owner;
+    searchState.loading = true;
+    searchState.error = "";
+    searchState.retryPage = page;
+    renderSearchResults();
+    try {
+      const endpoint = type === "posts" ? `/search.json?q=${encodeURIComponent(query)}&page=${page}` : `/search/query?term=${encodeURIComponent(query)}${type === "users" ? "&type_filter=user" : ""}`;
+      const data = await api(endpoint, undefined, req.signal);
+      if (!current()) return;
+      const error = data.errors?.join?.(" · ") || data.error || data.grouped_search_result?.error;
+      if (error) throw new Error(String(error));
+      const items = searchItems(data, type);
+      const previous = page === 1 ? [] : searchState.items;
+      const seen = new Set(previous.map(item => item.id));
+      searchState.items = previous.concat(items.filter(item => !seen.has(item.id)));
+      searchState.page = page;
+      searchState.more = type === "posts" && page < 10 && !!data.grouped_search_result?.more_full_page_results;
+      searchCoordinator.succeed(req.requestId, key);
+    } catch (err) {
+      if (!current() || err.name === "AbortError") return;
+      searchCoordinator.fail(req.requestId, key, err);
+      searchState.error = `搜索失败：${err.message || "网络异常"}`;
+    } finally {
+      if (current()) {
+        searchState.loading = false;
+        renderSearchResults();
+      }
+    }
+  }
 
   function ensureMain() {
     let main = document.querySelector(".codex-main");
@@ -4496,7 +4831,6 @@
             <div class="cx-spacer"></div>
             <div class="cx-icon-btn cx-panel-toggle" title="显示 / 隐藏代码面板" data-panel-toggle>${ICONS.panel}</div>
             <div class="cx-icon-btn" title="在原生界面打开" data-open-native>${ICONS.external}</div>
-            <div class="cx-icon-btn" title="更多（装饰）">${ICONS.dots}</div>
           </header>
           <div class="codex-thread cx-view-list">
             <div class="codex-thread-inner">
@@ -4522,36 +4856,19 @@
           <div class="codex-thread cx-view-detail" style="display:none">
             <div class="codex-thread-inner cx-thread-posts"></div>
           </div>
+          ${searchViewHtml()}
           <div class="codex-composer-wrap">
             <div class="codex-composer">
               <div class="cx-compose-target"><span></span><button type="button" title="取消回复">×</button></div>
               <div class="cx-compose-preview" aria-live="polite"></div>
-              <div class="cx-md-edit" data-cx-compose="1" contenteditable="true" role="textbox" aria-multiline="true" data-placeholder="发送消息…"></div>
+              <div class="cx-md-edit" data-cx-compose="1" contenteditable="true" role="textbox" aria-label="回复内容" aria-multiline="true" data-placeholder="发送消息…"></div>
               <div class="cx-composer-toolbar">${cxComposerToolbarHtml()}</div>
               <input type="file" class="cx-composer-file" accept="image/*" multiple hidden>
             </div>
           </div>
         </div>
         <div class="cx-resizer" data-resize="panel" title="拖拽调整分栏宽度"></div>
-        <!-- 右侧代码面板：列表 / 详情共享同一实例（纯氛围装饰） -->
-        <aside class="cx-code-panel">
-          <div class="cx-code-tabs">
-            <div class="cx-code-tab"><span class="cx-rs-ic">RS</span><span data-code-file-name>lib.rs</span><span class="cx-close" title="关闭代码面板">×</span></div>
-            <span class="cx-code-add" title="新建标签（装饰）">＋</span>
-            <div class="cx-code-tabs-actions">
-              <span class="cx-icon-btn" title="放大（装饰）">${ICONS.expand}</span>
-              <span class="cx-icon-btn" title="分栏（装饰）">${ICONS.panel}</span>
-              <span class="cx-icon-btn" data-panel-toggle2 title="关闭面板">${ICONS.sidebar}</span>
-            </div>
-          </div>
-          <div class="cx-code-crumb">
-            <div class="cx-crumbs"><span class="cx-seg">linux-do</span> › <span class="cx-seg" data-code-crumb-cat>topics</span> › <span class="cx-seg" data-code-crumb-dir>engine</span> › <span class="cx-cur" data-code-crumb-file>lib.rs</span></div>
-            <span class="cx-spacer"></span>
-            <div class="cx-code-view-toggle" data-code-view-toggle><span class="cx-on" data-v="code">代码</span><span data-v="diff">diff</span></div>
-            <button class="cx-open-btn" title="切换语言（装饰）" data-open-menu-btn><span data-open-lang-label>Java</span><svg class="cx-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="7 9 12 14 17 9"/></svg></button>
-          </div>
-          <div class="cx-code-body" data-code-body></div>
-        </aside>
+        ${codePanelHtml()}
       </div>`;
     document.body.appendChild(main);
     bindMainEvents(main);
@@ -4576,6 +4893,7 @@
   function bindMainEvents(main) {
     if (main.dataset.eventsBound === "1") return;
     main.dataset.eventsBound = "1";
+    bindSearchEvents(main);
 
     main.addEventListener("click", (e) => {
       // 窄屏抽屉开关
@@ -4638,43 +4956,22 @@
         if (matched) {
           activeSnippetId = matched.id;
         }
-        forceDemoCode = false;
+        snippetTopicId = threadState.topicId;
+        setCodeMode("code");
         setCodePanelHidden(false, true);
         renderCodePanel();
         return;
       }
-      // 切换到示例演示模式 / 退出演示模式
-      if (e.target.closest(".cx-btn-switch-demo")) {
-        forceDemoCode = true;
-        renderCodePanel();
-        return;
-      }
-      if (e.target.closest(".cx-btn-exit-demo")) {
-        forceDemoCode = false;
-        renderCodePanel();
-        return;
-      }
-      // 代码面板显隐：顶栏分屏按钮 / tab 行右侧按钮 / tab 上的 ×
-      if (e.target.closest("[data-panel-toggle]") || e.target.closest("[data-panel-toggle2]") || e.target.closest(".cx-code-tab .cx-close")) {
+      if (handleWorkspaceClick(e, main)) return;
+      // Shared panel visibility remains independent from active file tabs.
+      if (e.target.closest("[data-panel-toggle], [data-panel-toggle2]")) {
         setCodePanelHidden(!isCodePanelHidden(), true);
         return;
       }
-      // 「打开 ∨」→ 语言下拉；菜单项 → 切语言重渲染
-      if (e.target.closest("[data-open-menu-btn]")) {
-        toggleCodeLangMenu(main);
-        return;
-      }
-      const langItem = e.target.closest("[data-code-lang-item]");
-      if (langItem && main.contains(langItem)) {
-        setCodeLang(langItem.dataset.codeLangItem);
-        closeCodeLangMenu();
-        renderCodePanel();
-        return;
-      }
       // 代码 / diff 切换
-      const vt = e.target.closest("[data-code-view-toggle] span");
+      const vt = e.target.closest("[data-code-view-toggle] button");
       if (vt && main.contains(vt)) {
-        main.querySelectorAll("[data-code-view-toggle] span").forEach((x) =>
+        main.querySelectorAll("[data-code-view-toggle] button").forEach((x) =>
           x.classList.toggle("cx-on", x === vt)
         );
         setCodeMode(vt.dataset.v || "code");
@@ -4744,7 +5041,7 @@
         return;
       }
       // 正文内站内链接软跳转
-      const a = e.target.closest(".cx-view-detail a[href], .cx-view-list a[href]");
+      const a = e.target.closest(".cx-view-detail a[href], .cx-view-list a[href], .cx-view-search a[href]");
       if (a && main.contains(a)) {
         if (e.defaultPrevented) return;
         if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
@@ -4816,6 +5113,9 @@
     const detail = main.querySelector(".cx-view-detail");
     if (list) list.style.display = view === "list" ? "" : "none";
     if (detail) detail.style.display = view === "detail" ? "" : "none";
+    main.querySelector(".cx-view-search").style.display = view === "search" ? "" : "none";
+    main.querySelector(".codex-composer-wrap").style.display = view === "search" ? "none" : "";
+    if (view === "search") cxClosePop();
   }
 
   /** 顶栏面包屑 + 大标题 + composer placeholder 随路由同步 */
@@ -4903,13 +5203,24 @@
     const h1 = main.querySelector(".cx-proj-head h1");
     const desc = main.querySelector(".cx-proj-desc");
     const mdEdit = main.querySelector(".codex-composer .cx-md-edit");
+    const composeContext = main.querySelector(".cx-composer-context");
 
-    if (isTopicPath(pathname)) {
+    if (isSearchPath(pathname)) {
+      if (proj) proj.textContent = "搜索";
+      if (model) model.textContent = searchRoute().query || "工作区";
+    } else if (isTopicPath(pathname)) {
       const title = threadState.title || "加载中…";
       const cat = threadState.categoryId ? categoryById(threadState.categoryId) : null;
       if (proj) proj.textContent = cat ? cat.name : "话题";
       if (model) model.textContent = `${title} · ${threadState.postsCount || "–"} 楼`;
-      if (mdEdit) mdEdit.dataset.placeholder = `回复「${title}」…`;
+      if (mdEdit) {
+        mdEdit.dataset.placeholder = "补充说明，继续讨论…";
+        mdEdit.setAttribute("aria-label", `回复「${title}」`);
+      }
+      if (composeContext) {
+        composeContext.querySelector("span").textContent = "回复话题";
+        composeContext.title = `回复「${title}」`;
+      }
     } else {
       const title = listTitleForPath(pathname);
       if (proj) proj.textContent = title;
@@ -4922,7 +5233,14 @@
           ? `${(cat.description_text || "").slice(0, 60)} · 共 ${cat.topic_count ?? "–"} 个话题`
           : `共 ${listState.topics.length} 个已加载话题`;
       }
-      if (mdEdit) mdEdit.dataset.placeholder = `在 ${title} 发新话题…`;
+      if (mdEdit) {
+        mdEdit.dataset.placeholder = "写下新话题的内容…";
+        mdEdit.setAttribute("aria-label", `在 ${title} 发新话题`);
+      }
+      if (composeContext) {
+        composeContext.querySelector("span").textContent = "新话题";
+        composeContext.title = `在 ${title} 发新话题`;
+      }
     }
     // 筛选 chips 高亮跟随当前列表路由
     const onPath = location.pathname;
@@ -4935,7 +5253,7 @@
     });
     // /new 路由下激活「所有/话题/回复」筛选条（吸附原生 toggle）
     syncCxNewToggle();
-    // 代码面板跟随路由换种子（列表 = 路由哈希，详情 = 话题 id；内部有签名去重）
+    // 工作区独立于论坛路由，只有文件或视图发生变化时才刷新代码。
     renderCodePanel();
   }
 
@@ -5006,31 +5324,36 @@
   }
 
   async function loadList(apiPath, force) {
-    if (!apiPath) return;
+    if (!apiPath || !isThemeActive()) return;
     const reqKey = `list:${apiPath}`;
-    if (!force && listCoordinator.loadedKey === reqKey && listState.topics.length) {
+    if (!force && listCoordinator.activeKey === reqKey && listCoordinator.status === "loading") return;
+    if (!force && listCoordinator.activeKey === reqKey && listCoordinator.loadedKey === reqKey) {
       syncAppChrome();
       renderRailDynamic();
       return;
     }
     // 手动重试 (force) 绕过失败冷却；自动请求受 8 秒防风暴保护
-    if (!force && listState.failedAt && Date.now() - listState.failedAt < 8000) return;
+    if (!force && listCoordinator.activeKey === reqKey && listState.failedAt && Date.now() - listState.failedAt < 8000) return;
 
+    listMoreCoordinator.cancel();
     const req = listCoordinator.begin(reqKey);
+    const ownerPage = location.pathname;
     listState.loading = true;
+    listState.moreUrl = null;
     listState.apiPath = apiPath;
     listState.path = location.pathname;
     renderListRows();
 
     try {
       const data = await api(apiPath, undefined, req.signal);
-      if (!req.isCurrent() || !isThemeActive()) return;
+      if (!req.isCurrent() || !isThemeActive() || location.pathname !== ownerPage) return;
       listCoordinator.succeed(req.requestId, reqKey);
       listState.failedAt = 0;
+      listState.loading = false;
       applyListJson(data, false);
     } catch (err) {
       if (err && err.name === "AbortError") return;
-      if (!req.isCurrent() || !isThemeActive()) return;
+      if (!req.isCurrent() || !isThemeActive() || location.pathname !== ownerPage) return;
       listCoordinator.fail(req.requestId, reqKey, err);
       listState.failedAt = Date.now();
       const status = /HTTP (\d+)/.exec(err && err.message || "")?.[1];
@@ -5054,13 +5377,26 @@
   }
 
   async function loadMoreList() {
-    if (!listState.moreUrl || listState.loading) return;
+    if (!isThemeActive() || !isHomePath(location.pathname) || !listState.moreUrl || listState.loading) return;
+    const ownerPage = location.pathname;
+    const ownerApi = listState.apiPath;
+    const ownerKey = listCoordinator.activeKey;
+    const ownerVersion = listCoordinator.currentRequestId;
+    const moreUrl = listState.moreUrl;
+    const req = listMoreCoordinator.begin(`${ownerKey}:${moreUrl}`);
+    // Transport cancellation alone cannot prevent an already-resolved response/finally
+    // from altering a replacement list (or a new request for the same page).
+    const isCurrent = () => req.isCurrent() && listCoordinator.isCurrent(ownerVersion, ownerKey) &&
+      listState.apiPath === ownerApi && location.pathname === ownerPage && isThemeActive();
     listState.loading = true;
     try {
-      const data = await api(listState.moreUrl);
+      const data = await api(moreUrl, undefined, req.signal);
+      if (!isCurrent()) return;
+      listMoreCoordinator.succeed(req.requestId, req.key);
+      listState.loading = false;
       applyListJson(data, true);
     } catch { /* 保留现状 */ } finally {
-      listState.loading = false;
+      if (isCurrent()) listState.loading = false;
     }
   }
 
@@ -5638,8 +5974,11 @@
     const out = [];
     box.querySelectorAll(".cx-turn-user[data-post-number], .cx-turn-agent[data-post-number]")
       .forEach((el) => {
-        const r = el.getBoundingClientRect();
-        if (r.bottom < vr.top || r.top > vr.bottom) return;
+        // Expanded activity can fill the viewport while the actual reply is still below it.
+        const body = el.querySelector(":scope > .cx-cooked, :scope > .cx-turn-user-bubble");
+        if (!body) return;
+        const r = body.getBoundingClientRect();
+        if (!r.height || r.bottom <= vr.top || r.top >= vr.bottom) return;
         const n = Number(el.dataset.postNumber);
         if (n > 0) out.push(n);
       });
@@ -5647,7 +5986,7 @@
   }
 
   async function flushReadTrack() {
-    if (readFlushing || !readTimings.size || !readActiveTopic) return;
+    if (!isThemeActive() || readFlushing || !readTimings.size || !readActiveTopic) return;
     const id = readActiveTopic;
     const batch = [];
     for (const [n, ms] of readTimings) {
@@ -5683,7 +6022,7 @@
   }
 
   function tickReadTrack() {
-    if (otherThemeActive()) return;
+    if (!isThemeActive()) return;
     const now = Date.now();
     const diff = now - readLastTick;
     readLastTick = now;
@@ -5713,77 +6052,42 @@
     for (const n of nums) readTimings.set(n, (readTimings.get(n) || 0) + diff);
   }
 
+  let readTrackTimer = null;
   function startReadTracking() {
-    if (window.__codexReadTrackBound) return;
-    window.__codexReadTrackBound = true;
-    // 滚动不冒泡，capture 阶段委托；只认详情滚动容器
-    document.addEventListener("scroll", (e) => {
-      if (e.target instanceof Element && e.target.closest(".cx-view-detail")) {
-        readLastScrolled = Date.now();
-      }
-    }, true);
-    document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "hidden") flushReadTrack();
-      readLastTick = Date.now();
-    });
-    window.addEventListener("pagehide", () => flushReadTrack());
+    if (readTrackTimer) return;
+    if (!window.__codexReadTrackBound) {
+      window.__codexReadTrackBound = true;
+      // 滚动不冒泡，capture 阶段委托；只认详情滚动容器
+      document.addEventListener("scroll", (e) => {
+        if (e.target instanceof Element && e.target.closest(".cx-view-detail")) {
+          readLastScrolled = Date.now();
+        }
+      }, true);
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") flushReadTrack();
+        readLastTick = Date.now();
+      });
+      window.addEventListener("pagehide", () => flushReadTrack());
+    }
     readLastTick = readLastScrolled = Date.now();
-    setInterval(tickReadTrack, READ_TICK_MS);
+    readTrackTimer = setInterval(tickReadTrack, READ_TICK_MS);
   }
 
-/* ============================== 右侧代码面板（纯氛围，移植自 codex-mock.html） ============================== */
+  function stopReadTracking() {
+    clearInterval(readTrackTimer);
+    readTrackTimer = null;
+    readActiveTopic = null;
+    readTimings.clear();
+    readTotal.clear();
+    readTopicTime = readSinceFlush = 0;
+  }
+
+/* ============================== 项目代码工作区 ============================== */
 
   const CODE_LANG_NAMES = { rust: "Rust", python: "Python", typescript: "TypeScript", go: "Go", java: "Java" };
 
-  /** 「打开 ∨」下拉：选择代码语言 */
-  function closeCodeLangMenu() {
-    document.querySelector(".cx-lang-menu")?.remove();
-  }
-
-  function toggleCodeLangMenu(main) {
-    const exist = document.querySelector(".cx-lang-menu");
-    if (exist) { exist.remove(); return; }
-    const btn = main.querySelector("[data-open-menu-btn]");
-    if (!btn) return;
-    const cur = getCodeLang();
-    const menu = document.createElement("div");
-    menu.className = "cx-lang-menu";
-    menu.innerHTML = Object.keys(CODE_LANGS)
-      .map((k) =>
-        `<div class="cx-lang-item${k === cur ? " cx-on" : ""}" data-code-lang-item="${k}">` +
-        `<span>${CODE_LANG_NAMES[k] || k}</span>` +
-        (k === cur
-          ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`
-          : "") +
-        `</div>`
-      )
-      .join("");
-    main.appendChild(menu);
-    const r = btn.getBoundingClientRect();
-    const w = menu.offsetWidth;
-    menu.style.top = `${r.bottom + 6}px`;
-    menu.style.left = `${Math.max(8, Math.min(r.right - w, window.innerWidth - w - 8))}px`;
-    // 下一次事件循环再挂一次性关闭监听，避免吞掉本次点击
-    setTimeout(() => {
-      document.addEventListener("click", closeCodeLangMenu, { once: true, capture: true });
-    }, 0);
-  }
-
-  const CODE_LANG_KEY = "linuxdo-codex-code-lang";   // rust/python/typescript/go/java
-  const CODE_MODE_KEY = "linuxdo-codex-code-mode";   // "code" | "diff"
-  const CODE_PANEL_KEY = "linuxdo-codex-code-panel"; // "0" = 隐藏
-
-  function getCodeLang() {
-    try {
-      const v = localStorage.getItem(CODE_LANG_KEY);
-      if (v && CODE_LANGS[v]) return v;
-    } catch { /* ignore */ }
-    return "rust";
-  }
-
-  function setCodeLang(lang) {
-    try { localStorage.setItem(CODE_LANG_KEY, lang); } catch { /* ignore */ }
-  }
+  const CODE_MODE_KEY = "linuxdo-codex-code-mode";
+  const CODE_PANEL_KEY = "linuxdo-codex-code-panel";
 
   function getCodeMode() {
     try {
@@ -5902,79 +6206,199 @@
   }
 
   const CODE_LANGS = {
-    rust: {
-      file: "lib.rs", dir: "engine", icon: "RS", comment: "//",
-      kw: ["fn","let","mut","impl","pub","use","struct","enum","match","if","else","for","in","return","mod","crate","self","Self","async","await","move","where","const","trait","loop","while","Ok","Err","Some","None","Box","Vec","String","Result","Option"],
-      blocks: [
-        ["use std::collections::HashMap;", "use std::sync::{Arc, Mutex};", ""],
-        ["pub struct TopicCache {", "    entries: HashMap<u64, CachedTopic>,", "    ttl: Duration,", "    hits: Arc<Mutex<u64>>,", "}", ""],
-        ["impl TopicCache {", "    pub fn new(ttl: Duration) -> Self {", "        Self { entries: HashMap::new(), ttl, hits: Arc::new(Mutex::new(0)) }", "    }", "}", ""],
-        ["    pub fn get(&self, id: u64) -> Option<CachedTopic> {", "        match self.entries.get(&id) {", "            Some(t) if !t.expired(self.ttl) => Some(t.clone()),", "            _ => None,", "        }", "    }", ""],
-        ["    pub async fn refresh(&mut self, id: u64) -> Result<(), FetchError> {", "        let fresh = fetch_topic(id).await?;", "        self.entries.insert(id, fresh.into());", "        *self.hits.lock().unwrap() += 1;", "        Ok(())", "    }", ""],
-        ["#[derive(Debug, Clone)]", "pub enum RenderMode {", "    List,", "    Detail { topic_id: u64 },", "    Split { topic_id: u64, panel: PanelKind },", "}", ""],
-        ["    fn evict_stale(&mut self) -> usize {", "        let before = self.entries.len();", "        self.entries.retain(|_, v| !v.expired(self.ttl));", "        before - self.entries.len()", "    }", ""],
-        ["// 缓存淘汰策略：先按 TTL，再按 LRU 兜底", "// 注意保持与 metrics 上报的一致性", ""],
-        ["    pub fn stats(&self) -> CacheStats {", "        CacheStats {", "            size: self.entries.len(),", "            hits: *self.hits.lock().unwrap(),", "            hit_rate: self.hits.lock().unwrap().checked_div(self.entries.len() as u64).unwrap_or(0),", "        }", "    }", ""],
-        ["#[cfg(test)]", "mod tests {", "    use super::*;", "", "    #[test]", "    fn stale_entry_is_evicted() {", "        let mut c = TopicCache::new(Duration::from_secs(0));", "        c.entries.insert(1, CachedTopic::default());", "        assert_eq!(c.evict_stale(), 1);", "    }", "}", ""]
-      ]
-    },
-    python: {
-      file: "pipeline.py", dir: "workers", icon: "PY", comment: "#",
-      kw: ["def","class","return","if","else","elif","for","while","in","import","from","as","with","try","except","finally","raise","lambda","None","True","False","async","await","yield","pass","self","is","not","and","or"],
-      blocks: [
-        ["import asyncio", "import hashlib", "from dataclasses import dataclass, field", "from typing import Optional", ""],
-        ["@dataclass", "class TopicSnapshot:", "    topic_id: int", "    title: str", "    posts: list = field(default_factory=list)", "    fetched_at: float = 0.0", ""],
-        ["class Pipeline:", '    """话题抓取流水线：拉取 -> 清洗 -> 落库。"""', "", "    def __init__(self, workers: int = 8):", "        self.workers = workers", "        self.queue: asyncio.Queue = asyncio.Queue(maxsize=1024)", "        self.seen: set[int] = set()", ""],
-        ["    async def run(self) -> None:", "        producers = [asyncio.create_task(self.produce(i)) for i in range(2)]", "        consumers = [asyncio.create_task(self.consume(i)) for i in range(self.workers)]", "        await asyncio.gather(*producers, *consumers)", ""],
-        ["    async def consume(self, idx: int) -> None:", "        while True:", "            snap = await self.queue.get()", "            try:", "                await self.persist(snap)", "            except Exception as exc:", '                logger.warning("persist failed: %s", exc)', "            finally:", "                self.queue.task_done()", ""],
-        ["    def fingerprint(self, snap: TopicSnapshot) -> str:", "        digest = hashlib.sha256(snap.title.encode()).hexdigest()", "        return digest[:16]", ""],
-        ["    async def persist(self, snap: TopicSnapshot) -> None:", "        key = self.fingerprint(snap)", "        if key in self.seen:", "            return", "        await store.upsert(key, snap)", "        self.seen.add(key)", ""],
-        ["def backoff(attempt: int, base: float = 0.5) -> float:", "    # 指数退避 + 抖动，避免雪崩", "    return base * (2 ** attempt) * (0.5 + random.random())", ""],
-        ["async def main() -> None:", "    pipe = Pipeline(workers=16)", "    await pipe.run()", "", 'if __name__ == "__main__":', "    asyncio.run(main())", ""]
-      ]
-    },
-    typescript: {
-      file: "app.ts", dir: "web", icon: "TS", comment: "//",
-      kw: ["const","let","var","function","return","if","else","for","of","in","while","import","from","export","default","class","extends","interface","type","enum","new","this","async","await","try","catch","finally","throw","switch","case","break","readonly","public","private","void","string","number","boolean","Promise","Map","Set"],
-      blocks: [
-        ['import { EventEmitter } from "events";', 'import type { Topic, Post } from "./types";', ""],
-        ["interface CacheEntry<T> {", "  value: T;", "  expiresAt: number;", "}", ""],
-        ["export class TopicStore extends EventEmitter {", "  private cache = new Map<number, CacheEntry<Topic>>();", "  private readonly ttl = 30_000;", "", "  constructor(private readonly client: ApiClient) {", "    super();", "  }", "}", ""],
-        ["  async get(id: number): Promise<Topic | null> {", "    const hit = this.cache.get(id);", "    if (hit && hit.expiresAt > Date.now()) return hit.value;", '    const fresh = await this.client.fetchTopic(id);', "    this.cache.set(id, { value: fresh, expiresAt: Date.now() + this.ttl });", '    this.emit("update", fresh);', "    return fresh;", "  }", ""],
-        ["  invalidate(id?: number): void {", "    if (id === undefined) this.cache.clear();", "    else this.cache.delete(id);", "  }", ""],
-        ["export function renderRow(topic: Topic): string {", '  const unread = topic.unread > 0 ? "●" : "○";', "  return `${unread} ${topic.title} (${topic.postsCount - 1} 回复)`;", "}", ""],
-        ["// 状态机：idle -> loading -> ready | error", "type ViewState =", '  | { kind: "idle" }', '  | { kind: "loading" }', '  | { kind: "ready"; posts: Post[] }', '  | { kind: "error"; message: string };', ""],
-        ["export function reduce(state: ViewState, ev: ViewEvent): ViewState {", "  switch (ev.type) {", '    case "load": return { kind: "loading" };', '    case "ok":  return { kind: "ready", posts: ev.posts };', '    case "err": return { kind: "error", message: ev.message };', "    default:    return state;", "  }", "}", ""],
-        ["const store = new TopicStore(new ApiClient(BASE_URL));", 'store.on("update", (t) => console.log("topic updated", t.id));', ""]
-      ]
-    },
-    go: {
-      file: "main.go", dir: "cmd", icon: "GO", comment: "//",
-      kw: ["func","package","import","return","if","else","for","range","go","chan","select","case","default","type","struct","interface","map","var","const","defer","nil","err","string","int","bool","error","true","false"],
-      blocks: [
-        ["package main", "", 'import (', '    "context"', '    "fmt"', '    "sync"', '    "time"', ')', ""],
-        ["type TopicCache struct {", "    mu      sync.RWMutex", "    entries map[uint64]CachedTopic", "    ttl     time.Duration", "}", ""],
-        ["func NewTopicCache(ttl time.Duration) *TopicCache {", "    return &TopicCache{entries: make(map[uint64]CachedTopic), ttl: ttl}", "}", ""],
-        ["func (c *TopicCache) Get(id uint64) (CachedTopic, bool) {", "    c.mu.RLock()", "    defer c.mu.RUnlock()", "    t, ok := c.entries[id]", "    if !ok || t.Expired(c.ttl) {", "        return CachedTopic{}, false", "    }", "    return t, true", "}", ""],
-        ["func (c *TopicCache) Refresh(ctx context.Context, id uint64) error {", "    fresh, err := FetchTopic(ctx, id)", "    if err != nil {", '        return fmt.Errorf("refresh topic %d: %w", id, err)', "    }", "    c.mu.Lock()", "    defer c.mu.Unlock()", "    c.entries[id] = fresh", "    return nil", "}", ""],
-        ["// 后台定时清理过期条目", "func (c *TopicCache) EvictLoop(ctx context.Context) {", "    tick := time.NewTicker(time.Minute)", "    defer tick.Stop()", "    for {", "        select {", "        case <-ctx.Done():", "            return", "        case <-tick.C:", "            c.evictStale()", "        }", "    }", "}", ""],
-        ["func main() {", "    ctx, cancel := context.WithCancel(context.Background())", "    defer cancel()", "    cache := NewTopicCache(30 * time.Second)", "    go cache.EvictLoop(ctx)", '    fmt.Println("listening on :8080")', "}", ""]
-      ]
-    },
-    java: {
-      file: "TopicService.java", dir: "src/main/java", icon: "JV", comment: "//",
-      kw: ["public","private","protected","class","interface","enum","static","final","void","return","if","else","for","while","new","this","import","package","extends","implements","try","catch","finally","throw","throws","int","long","boolean","String","List","Map","Optional","var"],
-      blocks: [
-        ["package com.example.topics;", "", "import java.time.Duration;", "import java.util.Map;", "import java.util.Optional;", "import java.util.concurrent.ConcurrentHashMap;", ""],
-        ["public class TopicService {", "", "    private final Map<Long, CachedTopic> cache = new ConcurrentHashMap<>();", "    private final Duration ttl;", "    private final TopicClient client;", ""],
-        ["    public TopicService(TopicClient client, Duration ttl) {", "        this.client = client;", "        this.ttl = ttl;", "    }", ""],
-        ["    public Optional<CachedTopic> get(long id) {", "        CachedTopic hit = cache.get(id);", "        if (hit == null || hit.expired(ttl)) {", "            return Optional.empty();", "        }", "        return Optional.of(hit);", "    }", ""],
-        ["    public CachedTopic refresh(long id) throws FetchException {", "        CachedTopic fresh = client.fetchTopic(id);", "        cache.put(id, fresh);", "        return fresh;", "    }", ""],
-        ["    // 惰性淘汰：读路径上顺手清理", "    public int evictStale() {", "        int before = cache.size();", "        cache.values().removeIf(t -> t.expired(ttl));", "        return before - cache.size();", "    }", ""],
-        ["    public CacheStats stats() {", "        return new CacheStats(cache.size(), hits.get(), misses.get());", "    }", "}", ""]
-      ]
-    }
-  };
+  "rust": {
+    "kw": [
+      "fn",
+      "let",
+      "mut",
+      "impl",
+      "pub",
+      "use",
+      "struct",
+      "enum",
+      "match",
+      "if",
+      "else",
+      "for",
+      "in",
+      "return",
+      "mod",
+      "crate",
+      "self",
+      "Self",
+      "async",
+      "await",
+      "move",
+      "where",
+      "const",
+      "trait",
+      "loop",
+      "while",
+      "Ok",
+      "Err",
+      "Some",
+      "None",
+      "Box",
+      "Vec",
+      "String",
+      "Result",
+      "Option"
+    ],
+    "comment": "//"
+  },
+  "python": {
+    "kw": [
+      "def",
+      "class",
+      "return",
+      "if",
+      "else",
+      "elif",
+      "for",
+      "while",
+      "in",
+      "import",
+      "from",
+      "as",
+      "with",
+      "try",
+      "except",
+      "finally",
+      "raise",
+      "lambda",
+      "None",
+      "True",
+      "False",
+      "async",
+      "await",
+      "yield",
+      "pass",
+      "self",
+      "is",
+      "not",
+      "and",
+      "or"
+    ],
+    "comment": "#"
+  },
+  "typescript": {
+    "kw": [
+      "const",
+      "let",
+      "var",
+      "function",
+      "return",
+      "if",
+      "else",
+      "for",
+      "of",
+      "in",
+      "while",
+      "import",
+      "from",
+      "export",
+      "default",
+      "class",
+      "extends",
+      "interface",
+      "type",
+      "enum",
+      "new",
+      "this",
+      "async",
+      "await",
+      "try",
+      "catch",
+      "finally",
+      "throw",
+      "switch",
+      "case",
+      "break",
+      "readonly",
+      "public",
+      "private",
+      "void",
+      "string",
+      "number",
+      "boolean",
+      "Promise",
+      "Map",
+      "Set"
+    ],
+    "comment": "//"
+  },
+  "go": {
+    "kw": [
+      "func",
+      "package",
+      "import",
+      "return",
+      "if",
+      "else",
+      "for",
+      "range",
+      "go",
+      "chan",
+      "select",
+      "case",
+      "default",
+      "type",
+      "struct",
+      "interface",
+      "map",
+      "var",
+      "const",
+      "defer",
+      "nil",
+      "err",
+      "string",
+      "int",
+      "bool",
+      "error",
+      "true",
+      "false"
+    ],
+    "comment": "//"
+  },
+  "java": {
+    "kw": [
+      "public",
+      "private",
+      "protected",
+      "class",
+      "interface",
+      "enum",
+      "static",
+      "final",
+      "void",
+      "return",
+      "if",
+      "else",
+      "for",
+      "while",
+      "new",
+      "this",
+      "import",
+      "package",
+      "extends",
+      "implements",
+      "try",
+      "catch",
+      "finally",
+      "throw",
+      "throws",
+      "int",
+      "long",
+      "boolean",
+      "String",
+      "List",
+      "Map",
+      "Optional",
+      "var"
+    ],
+    "comment": "//"
+  }
+};
 
   const CODE_LANG_ALIASES = {
     ts: "typescript",
@@ -6177,85 +6601,721 @@
     return html;
   }
 
-  /** 按 话题id+语言 稳定生成一长段代码 */
-  function genCodeLines(langKey, topicId) {
-    const L = CODE_LANGS[langKey];
-    const rnd = mulberry32(((topicId || 0) * 2654435761 + langKey.length * 97 + 7) | 0);
-    const out = [];
-    let guard = 0;
-    while (out.length < 160 && guard++ < 60) {
-      const block = L.blocks[Math.floor(rnd() * L.blocks.length)];
-      out.push(...block);
-    }
-    return out;
-  }
+  const CODE_PROJECTS = [];
 
-  let codePanelLastSig = "";
+  CODE_PROJECTS.push({ id: "request-client", name: "request-client", language: "typescript", files: [
+    { path: "src/client.ts", language: "typescript", content: [
+      'import { HttpError, type RequestOptions } from "./types.ts";',
+      '',
+      'export class RequestClient {',
+      '  private readonly base: URL;',
+      '  private readonly transport: typeof fetch;',
+      '',
+      '  constructor(base: string, transport: typeof fetch = fetch) {',
+      '    this.base = new URL(base);',
+      '    this.transport = transport;',
+      '  }',
+      '',
+      '  async get<T>(path: string, options: RequestOptions = {}): Promise<T> {',
+      '    const url = new URL(path, this.base);',
+      '    if (url.origin !== this.base.origin) {',
+      '      throw new TypeError("Cross-origin requests are not allowed");',
+      '    }',
+      '',
+      '    const retries = Math.max(0, Math.min(options.retries ?? 2, 5));',
+      '    const timeoutMs = options.timeoutMs ?? 5000;',
+      '    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {',
+      '      throw new RangeError("timeoutMs must be positive");',
+      '    }',
+      '',
+      '    for (let attempt = 0; ; attempt++) {',
+      '      options.signal?.throwIfAborted();',
+      '      const timeout = AbortSignal.timeout(timeoutMs);',
+      '      const signal = options.signal',
+      '        ? AbortSignal.any([options.signal, timeout])',
+      '        : timeout;',
+      '',
+      '      try {',
+      '        const response = await this.transport(url, {',
+      '          method: "GET",',
+      '          headers: { Accept: "application/json", ...options.headers },',
+      '          signal,',
+      '        });',
+      '',
+      '        if (!response.ok) {',
+      '          await response.body?.cancel();',
+      '          throw new HttpError(response.status, url.pathname);',
+      '        }',
+      '        if (response.status === 204) return undefined as T;',
+      '        return await response.json() as T;',
+      '      } catch (error) {',
+      '        options.signal?.throwIfAborted();',
+      '        if (attempt >= retries || !this.isRetryable(error)) {',
+      '          throw error;',
+      '        }',
+      '        const delay = Math.min(250 * 2 ** attempt, 4000);',
+      '        await this.wait(delay, options.signal);',
+      '      }',
+      '    }',
+      '  }',
+      '',
+      '  private isRetryable(error: unknown): boolean {',
+      '    if (error instanceof HttpError) {',
+      '      return error.status === 429 || error.status >= 500;',
+      '    }',
+      '    return error instanceof TypeError ||',
+      '      (error instanceof DOMException && error.name === "TimeoutError");',
+      '  }',
+      '',
+      '  private wait(ms: number, signal?: AbortSignal): Promise<void> {',
+      '    return new Promise((resolve, reject) => {',
+      '      if (signal?.aborted) {',
+      '        reject(signal.reason);',
+      '        return;',
+      '      }',
+      '',
+      '      const cleanup = () => {',
+      '        clearTimeout(timer);',
+      '        signal?.removeEventListener("abort", onAbort);',
+      '      };',
+      '      const onAbort = () => {',
+      '        cleanup();',
+      '        reject(signal?.reason);',
+      '      };',
+      '      const timer = setTimeout(() => {',
+      '        cleanup();',
+      '        resolve();',
+      '      }, ms);',
+      '      signal?.addEventListener("abort", onAbort, { once: true });',
+      '    });',
+      '  }',
+      '}',
+    ].join("\n") },
+    { path: "src/types.ts", language: "typescript", content: [
+      'export interface RequestOptions {',
+      '  timeoutMs?: number;',
+      '  retries?: number;',
+      '  headers?: Record<string, string>;',
+      '  signal?: AbortSignal;',
+      '}',
+      '',
+      'export class HttpError extends Error {',
+      '  readonly status: number;',
+      '  readonly path: string;',
+      '',
+      '  constructor(status: number, path: string) {',
+      '    super(`HTTP ${status}: ${path}`);',
+      '    this.name = "HttpError";',
+      '    this.status = status;',
+      '    this.path = path;',
+      '  }',
+      '}',
+    ].join("\n") },
+    { path: "tests/client.test.ts", language: "typescript", content: [
+      'import { test } from "node:test";',
+      'import assert from "node:assert/strict";',
+      'import { RequestClient } from "../src/client.ts";',
+      'import { HttpError } from "../src/types.ts";',
+      '',
+      'test("decodes a successful response", async () => {',
+      '  const transport = (async () => Response.json({ id: 7 })) as typeof fetch;',
+      '  const client = new RequestClient("https://api.internal/", transport);',
+      '  assert.deepEqual(await client.get("/jobs/7"), { id: 7 });',
+      '});',
+      '',
+      'test("does not retry a missing resource", async () => {',
+      '  let calls = 0;',
+      '  const transport = (async () => {',
+      '    calls++;',
+      '    return new Response(null, { status: 404 });',
+      '  }) as typeof fetch;',
+      '  const client = new RequestClient("https://api.internal/", transport);',
+      '  await assert.rejects(client.get("/missing"), HttpError);',
+      '  assert.equal(calls, 1);',
+      '});',
+      '',
+      'test("rejects another origin before dispatch", async () => {',
+      '  const client = new RequestClient("https://api.internal/");',
+      '  await assert.rejects(client.get("https://elsewhere.invalid/"), TypeError);',
+      '});',
+    ].join("\n") }
+  ] });
 
-  /** 面板随机种子：详情 = 话题 id；列表 = 当前路由对应列表 API 的字符串哈希 */
-  function codePanelSeed() {
-    if (isTopicPath(location.pathname) && threadState.topicId) return threadState.topicId | 0;
-    const s = listApiForPath(location.pathname) || location.pathname || "/";
-    let h = 0;
-    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-    return h;
-  }
+  CODE_PROJECTS.push({ id: "task-pipeline", name: "task-pipeline", language: "python", files: [
+    { path: "pipeline/runner.py", language: "python", content: [
+      'import asyncio',
+      'from collections.abc import Awaitable, Callable',
+      'from dataclasses import dataclass',
+      '',
+      'from .config import PipelineConfig',
+      '',
+      '',
+      '@dataclass(frozen=True)',
+      'class Job:',
+      '    key: str',
+      '    payload: bytes',
+      '',
+      '',
+      '@dataclass(frozen=True)',
+      'class Outcome:',
+      '    key: str',
+      '    attempts: int',
+      '    error: str | None = None',
+      '',
+      '',
+      'Handler = Callable[[Job], Awaitable[None]]',
+      '',
+      '',
+      'class Pipeline:',
+      '    def __init__(self, config: PipelineConfig, handler: Handler):',
+      '        self.config = config',
+      '        self.handler = handler',
+      '        self.queue: asyncio.Queue[Job | None] = asyncio.Queue(',
+      '            maxsize=config.capacity',
+      '        )',
+      '        self.outcomes: list[Outcome] = []',
+      '        self._running = False',
+      '',
+      '    async def run(self, jobs: list[Job]) -> list[Outcome]:',
+      '        if self._running:',
+      '            raise RuntimeError("Pipeline is already running")',
+      '        self._running = True',
+      '        self.outcomes.clear()',
+      '        workers = [',
+      '            asyncio.create_task(self._consume(), name=f"worker-{i}")',
+      '            for i in range(self.config.workers)',
+      '        ]',
+      '        seen: set[str] = set()',
+      '        try:',
+      '            for job in jobs:',
+      '                if job.key in seen:',
+      '                    continue',
+      '                seen.add(job.key)',
+      '                await self.queue.put(job)',
+      '            for _ in workers:',
+      '                await self.queue.put(None)',
+      '            await self.queue.join()',
+      '            await asyncio.gather(*workers)',
+      '            return list(self.outcomes)',
+      '        finally:',
+      '            for worker in workers:',
+      '                worker.cancel()',
+      '            await asyncio.gather(*workers, return_exceptions=True)',
+      '            while not self.queue.empty():',
+      '                self.queue.get_nowait()',
+      '                self.queue.task_done()',
+      '            self._running = False',
+      '',
+      '    async def _consume(self) -> None:',
+      '        while True:',
+      '            job = await self.queue.get()',
+      '            try:',
+      '                if job is None:',
+      '                    return',
+      '                outcome = await self._execute(job)',
+      '                self.outcomes.append(outcome)',
+      '            finally:',
+      '                self.queue.task_done()',
+      '',
+      '    async def _execute(self, job: Job) -> Outcome:',
+      '        attempts = self.config.retries + 1',
+      '        for attempt in range(1, attempts + 1):',
+      '            try:',
+      '                async with asyncio.timeout(self.config.timeout):',
+      '                    await self.handler(job)',
+      '                return Outcome(job.key, attempt)',
+      '            except asyncio.CancelledError:',
+      '                raise',
+      '            except Exception as error:',
+      '                if attempt == attempts:',
+      '                    return Outcome(job.key, attempt, str(error))',
+      '                delay = self.config.backoff * 2 ** (attempt - 1)',
+      '                await asyncio.sleep(min(delay, 10.0))',
+      '        raise AssertionError("unreachable")',
+    ].join("\n") },
+    { path: "pipeline/config.py", language: "python", content: [
+      'from dataclasses import dataclass',
+      '',
+      '',
+      '@dataclass(frozen=True)',
+      'class PipelineConfig:',
+      '    workers: int = 4',
+      '    capacity: int = 128',
+      '    retries: int = 2',
+      '    timeout: float = 5.0',
+      '    backoff: float = 0.1',
+      '',
+      '    def __post_init__(self) -> None:',
+      '        if self.workers < 1 or self.capacity < 1:',
+      '            raise ValueError("workers and capacity must be positive")',
+      '        if self.retries < 0 or self.timeout <= 0 or self.backoff < 0:',
+      '            raise ValueError("invalid retry policy")',
+    ].join("\n") },
+    { path: "tests/test_runner.py", language: "python", content: [
+      'import unittest',
+      '',
+      'from pipeline.config import PipelineConfig',
+      'from pipeline.runner import Job, Pipeline',
+      '',
+      '',
+      'class PipelineTests(unittest.IsolatedAsyncioTestCase):',
+      '    async def test_duplicate_keys_are_processed_once(self):',
+      '        keys = []',
+      '',
+      '        async def handler(job):',
+      '            keys.append(job.key)',
+      '',
+      '        pipeline = Pipeline(PipelineConfig(), handler)',
+      '        result = await pipeline.run([Job("a", b"1"), Job("a", b"2")])',
+      '        self.assertEqual(keys, ["a"])',
+      '        self.assertIsNone(result[0].error)',
+      '',
+      '    async def test_failed_job_has_bounded_retries(self):',
+      '        async def handler(job):',
+      '            raise OSError("store unavailable")',
+      '',
+      '        config = PipelineConfig(retries=1, backoff=0)',
+      '        result = await Pipeline(config, handler).run([Job("b", b"")])',
+      '        self.assertEqual(result[0].attempts, 2)',
+      '        self.assertEqual(result[0].error, "store unavailable")',
+      '',
+      'if __name__ == "__main__":',
+      '    unittest.main()',
+    ].join("\n") }
+  ] });
 
-  const DEMO_CODE_BEFORE = [
-    "// Linux DO Codex · 演示环境",
-    "// 这是一个用于展示文本差异比较的静态示例代码",
-    "",
-    "interface TopicCacheEntry {",
-    "  topicId: number;",
-    "  title: string;",
-    "  loadedAt: number;",
-    "}",
-    "",
-    "class TopicService {",
-    "  private cache = new Map<number, TopicCacheEntry>();",
-    "  private ttl = 60000;",
-    "",
-    "  async fetchTopic(id: number) {",
-    "    const hit = this.cache.get(id);",
-    "    if (hit && Date.now() - hit.loadedAt < this.ttl) {",
-    "      return hit;",
-    "    }",
-    "    const res = await fetch(`/t/${id}.json`);",
-    "    const data = await res.json();",
-    "    this.cache.set(id, { topicId: id, title: data.title, loadedAt: Date.now() });",
-    "    return data;",
-    "  }",
-    "}"
-  ].join("\n");
+  CODE_PROJECTS.push({ id: "worker-pool", name: "worker-pool", language: "go", files: [
+    { path: "queue/pool.go", language: "go", content: [
+      'package queue',
+      '',
+      'import (',
+      '    "context"',
+      '    "fmt"',
+      '    "sync"',
+      '    "time"',
+      ')',
+      '',
+      'type Pool struct {',
+      '    workers int',
+      '    retries int',
+      '    backoff time.Duration',
+      '}',
+      '',
+      'func NewPool(workers, retries int) (*Pool, error) {',
+      '    if workers < 1 || retries < 0 {',
+      '        return nil, fmt.Errorf("invalid pool configuration")',
+      '    }',
+      '    return &Pool{workers: workers, retries: retries, backoff: 100 * time.Millisecond}, nil',
+      '}',
+      '',
+      '// Run returns one outcome for every accepted job, in completion order.',
+      'func (p *Pool) Run(ctx context.Context, jobs []Job, handle Handler) []Outcome {',
+      '    pending := make(chan Job)',
+      '    completed := make(chan Outcome, len(jobs))',
+      '    var workers sync.WaitGroup',
+      '',
+      '    for i := 0; i < p.workers; i++ {',
+      '        workers.Add(1)',
+      '        go func() {',
+      '            defer workers.Done()',
+      '            for job := range pending {',
+      '                completed <- p.execute(ctx, job, handle)',
+      '            }',
+      '        }()',
+      '    }',
+      '',
+      'dispatch:',
+      '    for _, job := range jobs {',
+      '        select {',
+      '        case <-ctx.Done():',
+      '            break dispatch',
+      '        case pending <- job:',
+      '        }',
+      '    }',
+      '    close(pending)',
+      '    workers.Wait()',
+      '    close(completed)',
+      '',
+      '    outcomes := make([]Outcome, 0, len(jobs))',
+      '    for outcome := range completed {',
+      '        outcomes = append(outcomes, outcome)',
+      '    }',
+      '    return outcomes',
+      '}',
+      '',
+      'func (p *Pool) execute(ctx context.Context, job Job, handle Handler) Outcome {',
+      '    result := Outcome{Key: job.Key}',
+      '    for attempt := 0; attempt <= p.retries; attempt++ {',
+      '        if err := ctx.Err(); err != nil {',
+      '            result.Err = err',
+      '            return result',
+      '        }',
+      '        result.Attempts++',
+      '        result.Err = handle(ctx, job)',
+      '        if result.Err == nil || attempt == p.retries {',
+      '            return result',
+      '        }',
+      '        delay := p.backoff * time.Duration(1<<min(attempt, 5))',
+      '        if err := wait(ctx, delay); err != nil {',
+      '            result.Err = err',
+      '            return result',
+      '        }',
+      '    }',
+      '    return result',
+      '}',
+      '',
+      'func wait(ctx context.Context, delay time.Duration) error {',
+      '    timer := time.NewTimer(delay)',
+      '    defer timer.Stop()',
+      '    select {',
+      '    case <-ctx.Done():',
+      '        return ctx.Err()',
+      '    case <-timer.C:',
+      '        return nil',
+      '    }',
+      '}',
+    ].join("\n") },
+    { path: "queue/job.go", language: "go", content: [
+      'package queue',
+      '',
+      'import "context"',
+      '',
+      'type Job struct {',
+      '    Key string',
+      '    Payload []byte',
+      '}',
+      '',
+      'type Handler func(context.Context, Job) error',
+      '',
+      'type Outcome struct {',
+      '    Key string',
+      '    Attempts int',
+      '    Err error',
+      '}',
+    ].join("\n") },
+    { path: "queue/pool_test.go", language: "go", content: [
+      'package queue',
+      '',
+      'import (',
+      '    "context"',
+      '    "errors"',
+      '    "testing"',
+      ')',
+      '',
+      'func TestRetryBudget(t *testing.T) {',
+      '    pool, err := NewPool(2, 1)',
+      '    if err != nil { t.Fatal(err) }',
+      '    pool.backoff = 0',
+      '    failure := errors.New("storage unavailable")',
+      '    results := pool.Run(context.Background(), []Job{{Key: "a"}},',
+      '        func(context.Context, Job) error { return failure })',
+      '    if len(results) != 1 || results[0].Attempts != 2 {',
+      '        t.Fatalf("unexpected outcomes: %+v", results)',
+      '    }',
+      '    if !errors.Is(results[0].Err, failure) { t.Fatal(results[0].Err) }',
+      '}',
+      '',
+      'func TestWaitHonorsCancellation(t *testing.T) {',
+      '    ctx, cancel := context.WithCancel(context.Background())',
+      '    cancel()',
+      '    if err := wait(ctx, 1_000_000_000); !errors.Is(err, context.Canceled) {',
+      '        t.Fatalf("expected cancellation, got %v", err)',
+      '    }',
+      '}',
+    ].join("\n") },
+    { path: "go.mod", language: "text", content: 'module internal.dev/worker-pool\n\ngo 1.22\n' }
+  ] });
 
-  const DEMO_CODE_AFTER = [
-    "// Linux DO Codex · 演示环境",
-    "// 这是一个用于展示文本差异比较的静态示例代码",
-    "",
-    "interface TopicCacheEntry {",
-    "  topicId: number;",
-    "  title: string;",
-    "  loadedAt: number;",
-    "  version: number;",
-    "}",
-    "",
-    "class TopicService {",
-    "  private cache = new Map<number, TopicCacheEntry>();",
-    "  private ttl = 60000;",
-    "",
-    "  async fetchTopic(id: number, signal?: AbortSignal) {",
-    "    const hit = this.cache.get(id);",
-    "    if (hit && Date.now() - hit.loadedAt < this.ttl) {",
-    "      return hit;",
-    "    }",
-    "    const res = await fetch(`/t/${id}.json`, { signal });",
-    "    if (!res.ok) throw new Error(`HTTP ${res.status}`);",
-    "    const data = await res.json();",
-    "    this.cache.set(id, { topicId: id, title: data.title, loadedAt: Date.now(), version: 2 });",
-    "    return data;",
-    "  }",
-    "}"
-  ].join("\n");
+  CODE_PROJECTS.push({ id: "cache-engine", name: "cache-engine", language: "rust", files: [
+    { path: "src/lib.rs", language: "rust", content: [
+      'mod policy;',
+      '',
+      'pub use policy::CachePolicy;',
+      'use std::collections::HashMap;',
+      'use std::hash::Hash;',
+      'use std::time::Instant;',
+      '',
+      'struct Entry<V> {',
+      '    value: V,',
+      '    expires_at: Instant,',
+      '    touched_at: Instant,',
+      '}',
+      '',
+      '#[derive(Default, Debug, Clone, Copy)]',
+      'pub struct CacheStats {',
+      '    pub hits: u64,',
+      '    pub misses: u64,',
+      '    pub evictions: u64,',
+      '}',
+      '',
+      'pub struct Cache<K, V> {',
+      '    entries: HashMap<K, Entry<V>>,',
+      '    policy: CachePolicy,',
+      '    stats: CacheStats,',
+      '}',
+      '',
+      'impl<K: Eq + Hash + Clone, V> Cache<K, V> {',
+      '    pub fn new(policy: CachePolicy) -> Self {',
+      '        Self {',
+      '            entries: HashMap::new(),',
+      '            policy,',
+      '            stats: CacheStats::default(),',
+      '        }',
+      '    }',
+      '',
+      '    pub fn get(&mut self, key: &K) -> Option<&V> {',
+      '        let now = Instant::now();',
+      '        let expired = self.entries.get(key)',
+      '            .map(|entry| entry.expires_at <= now)',
+      '            .unwrap_or(false);',
+      '        if expired {',
+      '            self.entries.remove(key);',
+      '            self.stats.evictions += 1;',
+      '        }',
+      '        match self.entries.get_mut(key) {',
+      '            Some(entry) => {',
+      '                entry.touched_at = now;',
+      '                self.stats.hits += 1;',
+      '                Some(&entry.value)',
+      '            }',
+      '            None => {',
+      '                self.stats.misses += 1;',
+      '                None',
+      '            }',
+      '        }',
+      '    }',
+      '',
+      '    pub fn insert(&mut self, key: K, value: V) {',
+      '        self.purge_expired();',
+      '        if !self.entries.contains_key(&key) && self.entries.len() >= self.policy.capacity() {',
+      '            let oldest = self.entries.iter()',
+      '                .min_by_key(|(_, entry)| entry.touched_at)',
+      '                .map(|(key, _)| key.clone());',
+      '            if let Some(key) = oldest {',
+      '                self.entries.remove(&key);',
+      '                self.stats.evictions += 1;',
+      '            }',
+      '        }',
+      '        let now = Instant::now();',
+      '        self.entries.insert(key, Entry {',
+      '            value,',
+      '            expires_at: now + self.policy.ttl(),',
+      '            touched_at: now,',
+      '        });',
+      '    }',
+      '',
+      '    pub fn purge_expired(&mut self) -> usize {',
+      '        let now = Instant::now();',
+      '        let before = self.entries.len();',
+      '        self.entries.retain(|_, entry| entry.expires_at > now);',
+      '        let removed = before - self.entries.len();',
+      '        self.stats.evictions += removed as u64;',
+      '        removed',
+      '    }',
+      '',
+      '    pub fn invalidate(&mut self, key: &K) -> bool {',
+      '        self.entries.remove(key).is_some()',
+      '    }',
+      '',
+      '    pub fn stats(&self) -> CacheStats {',
+      '        self.stats',
+      '    }',
+      '}',
+    ].join("\n") },
+    { path: "src/policy.rs", language: "rust", content: [
+      'use std::num::NonZeroUsize;',
+      'use std::time::Duration;',
+      '',
+      '#[derive(Clone, Copy)]',
+      'pub struct CachePolicy {',
+      '    capacity: NonZeroUsize,',
+      '    ttl: Duration,',
+      '}',
+      '',
+      'impl CachePolicy {',
+      '    pub fn new(capacity: NonZeroUsize, ttl: Duration) -> Self {',
+      '        Self { capacity, ttl }',
+      '    }',
+      '',
+      '    pub fn capacity(&self) -> usize { self.capacity.get() }',
+      '    pub fn ttl(&self) -> Duration { self.ttl }',
+      '}',
+    ].join("\n") },
+    { path: "tests/cache.rs", language: "rust", content: [
+      'use cache_engine::{Cache, CachePolicy};',
+      'use std::num::NonZeroUsize;',
+      'use std::time::Duration;',
+      '',
+      '#[test]',
+      'fn expired_values_are_not_returned() {',
+      '    let policy = CachePolicy::new(NonZeroUsize::new(2).unwrap(), Duration::ZERO);',
+      '    let mut cache = Cache::new(policy);',
+      '    cache.insert("a", 7);',
+      '    assert_eq!(cache.get(&"a"), None);',
+      '    assert_eq!(cache.stats().misses, 1);',
+      '}',
+      '',
+      '#[test]',
+      'fn replacing_a_key_does_not_evict_another() {',
+      '    let policy = CachePolicy::new(NonZeroUsize::new(2).unwrap(), Duration::from_secs(60));',
+      '    let mut cache = Cache::new(policy);',
+      '    cache.insert("a", 1);',
+      '    cache.insert("b", 2);',
+      '    cache.insert("a", 3);',
+      '    assert_eq!(cache.get(&"a"), Some(&3));',
+      '    assert_eq!(cache.get(&"b"), Some(&2));',
+      '}',
+    ].join("\n") },
+    { path: "Cargo.toml", language: "text", content: '[package]\nname = "cache-engine"\nversion = "0.8.2"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n' }
+  ] });
+
+  CODE_PROJECTS.push({ id: "job-scheduler", name: "job-scheduler", language: "java", files: [
+    { path: "src/scheduler/JobScheduler.java", language: "java", content: [
+      'package scheduler;',
+      '',
+      'import java.util.Set;',
+      'import java.util.concurrent.*;',
+      'import java.util.concurrent.atomic.AtomicReference;',
+      '',
+      'public final class JobScheduler implements AutoCloseable {',
+      '    private final ScheduledThreadPoolExecutor executor;',
+      '    private final RetryPolicy policy;',
+      '    private final Semaphore capacity;',
+      '    private final Set<CompletableFuture<?>> pending = ConcurrentHashMap.newKeySet();',
+      '    private volatile boolean closed;',
+      '',
+      '    public JobScheduler(int workers, int capacity, RetryPolicy policy) {',
+      '        if (workers < 1 || capacity < 1) {',
+      '            throw new IllegalArgumentException("workers and capacity must be positive");',
+      '        }',
+      '        this.policy = java.util.Objects.requireNonNull(policy);',
+      '        this.capacity = new Semaphore(capacity);',
+      '        this.executor = new ScheduledThreadPoolExecutor(workers);',
+      '        this.executor.setRemoveOnCancelPolicy(true);',
+      '        this.executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);',
+      '    }',
+      '',
+      '    public <T> CompletableFuture<T> submit(Callable<T> operation) {',
+      '        java.util.Objects.requireNonNull(operation);',
+      '        if (closed || !capacity.tryAcquire()) {',
+      '            return CompletableFuture.failedFuture(',
+      '                new RejectedExecutionException("scheduler unavailable"));',
+      '        }',
+      '',
+      '        CompletableFuture<T> result = new CompletableFuture<>();',
+      '        AtomicReference<Future<?>> scheduled = new AtomicReference<>();',
+      '        pending.add(result);',
+      '        result.whenComplete((value, failure) -> {',
+      '            pending.remove(result);',
+      '            capacity.release();',
+      '            Future<?> task = scheduled.get();',
+      '            if (task != null) task.cancel(false);',
+      '        });',
+      '        schedule(operation, result, scheduled, 0);',
+      '        return result;',
+      '    }',
+      '',
+      '    private <T> void schedule(',
+      '        Callable<T> operation,',
+      '        CompletableFuture<T> result,',
+      '        AtomicReference<Future<?>> scheduled,',
+      '        int attempt',
+      '    ) {',
+      '        if (result.isDone()) return;',
+      '        if (closed) {',
+      '            result.cancel(false);',
+      '            return;',
+      '        }',
+      '        long delay = attempt == 0 ? 0 : policy.delayMillis(attempt);',
+      '        try {',
+      '            Future<?> task = executor.schedule(() -> {',
+      '                if (result.isDone()) return;',
+      '                try {',
+      '                    result.complete(operation.call());',
+      '                } catch (InterruptedException error) {',
+      '                    Thread.currentThread().interrupt();',
+      '                    result.completeExceptionally(error);',
+      '                } catch (Exception error) {',
+      '                    if (attempt >= policy.retries()) {',
+      '                        result.completeExceptionally(error);',
+      '                    } else {',
+      '                        schedule(operation, result, scheduled, attempt + 1);',
+      '                    }',
+      '                }',
+      '            }, delay, TimeUnit.MILLISECONDS);',
+      '            scheduled.set(task);',
+      '            if (result.isDone()) task.cancel(false);',
+      '        } catch (RejectedExecutionException error) {',
+      '            result.completeExceptionally(error);',
+      '        }',
+      '    }',
+      '',
+      '    public int pendingCount() {',
+      '        return pending.size();',
+      '    }',
+      '',
+      '    @Override',
+      '    public void close() {',
+      '        closed = true;',
+      '        pending.forEach(result -> result.cancel(false));',
+      '        executor.shutdownNow();',
+      '    }',
+      '}',
+    ].join("\n") },
+    { path: "src/scheduler/RetryPolicy.java", language: "java", content: [
+      'package scheduler;',
+      '',
+      'public record RetryPolicy(int retries, long baseDelayMillis, long maxDelayMillis) {',
+      '    public RetryPolicy {',
+      '        if (retries < 0 || baseDelayMillis < 0 || maxDelayMillis < baseDelayMillis) {',
+      '            throw new IllegalArgumentException("invalid retry policy");',
+      '        }',
+      '    }',
+      '',
+      '    public long delayMillis(int attempt) {',
+      '        long factor = 1L << Math.min(Math.max(attempt - 1, 0), 20);',
+      '        if (baseDelayMillis > maxDelayMillis / factor) return maxDelayMillis;',
+      '        return Math.min(baseDelayMillis * factor, maxDelayMillis);',
+      '    }',
+      '}',
+    ].join("\n") },
+    { path: "tests/scheduler/JobSchedulerTest.java", language: "java", content: [
+      'package scheduler;',
+      '',
+      'import java.util.concurrent.TimeUnit;',
+      'import java.util.concurrent.atomic.AtomicInteger;',
+      '',
+      'public final class JobSchedulerTest {',
+      '    public static void main(String[] args) throws Exception {',
+      '        RetryPolicy policy = new RetryPolicy(2, 1, 10);',
+      '        if (policy.delayMillis(10) != 10) throw new AssertionError("uncapped delay");',
+      '        try (JobScheduler scheduler = new JobScheduler(2, 16, policy)) {',
+      '            AtomicInteger calls = new AtomicInteger();',
+      '            String value = scheduler.submit(() -> {',
+      '                if (calls.incrementAndGet() == 1) throw new IllegalStateException("retry");',
+      '                return "ready";',
+      '            }).get(2, TimeUnit.SECONDS);',
+      '            if (!value.equals("ready") || calls.get() != 2) {',
+      '                throw new AssertionError("unexpected retry outcome");',
+      '            }',
+      '        }',
+      '    }',
+      '}',
+    ].join("\n") }
+  ] });
+
+  // Each baseline is a fixed previous revision of the same file, never random line coloring.
+  const PROJECT_REVISIONS = [
+    ['const timeoutMs = options.timeoutMs ?? 5000;', 'const timeoutMs = options.timeoutMs ?? 2000;'],
+    ['await asyncio.sleep(min(delay, 10.0))', 'await asyncio.sleep(delay)'],
+    ['time.Duration(1<<min(attempt, 5))', 'time.Duration(1<<attempt)'],
+    ['!self.entries.contains_key(&key) && self.entries.len()', 'self.entries.len()'],
+    ['this.executor.setRemoveOnCancelPolicy(true);', 'this.executor.setRemoveOnCancelPolicy(false);']
+  ];
+  CODE_PROJECTS.forEach((project, index) => {
+    const [after, before] = PROJECT_REVISIONS[index];
+    project.files[0].before = project.files[0].content.replace(after, before);
+  });
 
   function extForLang(lang) {
     const map = {
@@ -6447,156 +7507,166 @@
   }
 
   let activeSnippetId = null;
-  let forceDemoCode = false;
+  let snippetTopicId = null;
+  let activeProject = CODE_PROJECTS[Math.floor(Math.random() * CODE_PROJECTS.length)];
+  let activeProjectPath = activeProject.files[0].path;
+  let openProjectFiles = activeProject.files.slice(0, 2).map(file => file.path);
+  const codeScrollPositions = new Map();
+
+  function codePanelHtml() {
+    return `<aside class="cx-code-panel" aria-label="项目文件">
+      <div class="cx-workspace-bar"><button data-workspace-menu aria-expanded="false" title="切换工作区">${ICONS.folder}<span data-workspace-name></span>${ICONS.chevronDown}</button><span class="cx-workspace-branch">${ICONS.branch}main</span><button data-panel-toggle2 title="关闭面板" aria-label="关闭面板">${ICONS.sidebar}</button></div>
+      <div class="cx-code-tabs"><div class="cx-file-tabs" role="tablist" aria-label="打开的文件"></div><button class="cx-file-add" data-file-menu title="打开文件" aria-label="打开文件" aria-expanded="false">${ICONS.plus}</button></div>
+      <div class="cx-code-crumb"><div class="cx-crumbs"><span data-code-crumb-dir></span><span>›</span><span class="cx-cur" data-code-crumb-file></span></div><div class="cx-code-view-toggle" data-code-view-toggle><button data-v="code">代码</button><button data-v="diff">diff</button></div></div>
+      <div class="cx-snippet-actions" hidden></div>
+      <div class="cx-code-body" data-code-body tabindex="0" aria-label="源码"></div>
+      <div class="cx-code-status"><span data-code-status></span><span data-code-language></span></div>
+    </aside>`;
+  }
+
+  function rememberCodeScroll() {
+    const body = document.querySelector("[data-code-body]");
+    if (body?.dataset.scrollKey) codeScrollPositions.set(body.dataset.scrollKey, { top: body.scrollTop, left: body.scrollLeft });
+  }
+
+  function closeWorkspaceMenu() {
+    document.querySelector(".cx-workspace-picker")?.remove();
+    document.querySelectorAll("[data-workspace-menu], [data-file-menu]").forEach(el => el.setAttribute("aria-expanded", "false"));
+  }
+
+  function toggleWorkspaceMenu(main, kind) {
+    const existing = main.querySelector(".cx-workspace-picker");
+    const same = existing?.dataset.kind === kind;
+    closeWorkspaceMenu();
+    if (same) return;
+    const menu = document.createElement("div");
+    menu.className = "cx-workspace-picker";
+    menu.dataset.kind = kind;
+    menu.innerHTML = kind === "projects"
+      ? `<div class="cx-picker-label">切换工作区</div>${CODE_PROJECTS.map(p => `<button data-project-id="${p.id}" aria-pressed="${p === activeProject}"><span>${escapeHtml(p.name)}</span><small>${CODE_LANG_NAMES[p.language]}</small></button>`).join("")}<button data-project-random>随机切换工作区</button>`
+      : `<div class="cx-picker-label">${escapeHtml(activeProject.name)}</div>${activeProject.files.map(f => `<button data-open-file="${escapeHtml(f.path)}"><span>${escapeHtml(f.path)}</span></button>`).join("")}`;
+    main.querySelector(".cx-code-panel").append(menu);
+    const trigger = main.querySelector(kind === "projects" ? "[data-workspace-menu]" : "[data-file-menu]");
+    trigger.setAttribute("aria-expanded", "true");
+    menu.querySelector("button")?.focus();
+    const outside = e => {
+      if (!menu.contains(e.target) && !trigger.contains(e.target)) closeWorkspaceMenu();
+    };
+    const keys = e => {
+      if (e.key === "Escape") { closeWorkspaceMenu(); trigger.focus(); }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const buttons = [...menu.querySelectorAll("button")];
+        const step = e.key === "ArrowDown" ? 1 : -1;
+        buttons[(buttons.indexOf(document.activeElement) + step + buttons.length) % buttons.length]?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", outside, true);
+    menu.addEventListener("keydown", keys);
+    // A menu-specific observer only releases the outside listener on menu removal.
+    const cleanup = new MutationObserver(() => {
+      if (!menu.isConnected) { document.removeEventListener("pointerdown", outside, true); cleanup.disconnect(); }
+    });
+    cleanup.observe(main.querySelector(".cx-code-panel"), { childList: true });
+  }
+
+  function handleWorkspaceClick(e, main) {
+    if (e.target.closest("[data-workspace-menu]")) { toggleWorkspaceMenu(main, "projects"); return true; }
+    if (e.target.closest("[data-file-menu]")) { toggleWorkspaceMenu(main, "files"); return true; }
+    const projectButton = e.target.closest("[data-project-id], [data-project-random]");
+    if (projectButton) {
+      rememberCodeScroll();
+      const alternatives = CODE_PROJECTS.filter(p => p !== activeProject);
+      activeProject = projectButton.hasAttribute("data-project-random")
+        ? alternatives[Math.floor(Math.random() * alternatives.length)]
+        : CODE_PROJECTS.find(p => p.id === projectButton.dataset.projectId) || activeProject;
+      activeProjectPath = activeProject.files[0].path;
+      openProjectFiles = activeProject.files.slice(0, 2).map(f => f.path);
+      activeSnippetId = null;
+      closeWorkspaceMenu();
+      renderCodePanel();
+      return true;
+    }
+    const close = e.target.closest("[data-close-file]");
+    const open = e.target.closest("[data-open-file], [data-select-file]");
+    if (close || open) {
+      rememberCodeScroll();
+      const target = close?.dataset.closeFile || open.dataset.openFile || open.dataset.selectFile;
+      if (target === "@snippet") {
+        if (close) activeSnippetId = null;
+      } else if (close) {
+        const index = openProjectFiles.indexOf(target);
+        openProjectFiles = openProjectFiles.filter(p => p !== target);
+        if (activeProjectPath === target) activeProjectPath = openProjectFiles[Math.max(0, index - 1)] || null;
+      } else if (activeProject.files.some(f => f.path === target)) {
+        if (!openProjectFiles.includes(target)) openProjectFiles.push(target);
+        activeProjectPath = target;
+        activeSnippetId = null;
+      }
+      closeWorkspaceMenu();
+      renderCodePanel();
+      return true;
+    }
+    return false;
+  }
+
+  function codeLinesHtml(content, language) {
+    return content.split("\n").map((line, i) => `<div class="cx-cline"><span class="cx-ln">${i + 1}</span><span class="cx-lc">${highlightCode(line, language)}</span></div>`).join("");
+  }
+
+  function fileDiffHtml(file) {
+    if (file.before === undefined || file.before === file.content) return '<div class="cx-code-empty">无更改</div>';
+    const diff = computeTextDiff(file.before, file.content);
+    const lines = [`diff --git a/${file.path} b/${file.path}`, `--- a/${file.path}`, `+++ b/${file.path}`];
+    let html = `<div class="cx-diff-summary">${diff.additions} additions · ${diff.deletions} deletions</div>`;
+    html += lines.map(line => `<div class="cx-cline cx-meta"><span class="cx-ln"></span><span class="cx-lc">${escapeHtml(line)}</span></div>`).join("");
+    for (const hunk of diff.hunks) {
+      html += `<div class="cx-cline cx-hunk"><span class="cx-ln"></span><span class="cx-lc">${escapeHtml(hunk.header)}</span></div>`;
+      html += hunk.lines.map(line => `<div class="cx-cline cx-${line.kind}"><span class="cx-ln">${line.kind === "del" ? line.oldLineNo : line.newLineNo}</span><span class="cx-lc">${line.kind === "add" ? "+ " : line.kind === "del" ? "- " : "  "}${highlightCode(line.text, file.language)}</span></div>`).join("");
+    }
+    return html;
+  }
 
   function renderCodePanel() {
-    const main = document.querySelector(".codex-main");
-    if (!main) return;
-    const body = main.querySelector("[data-code-body]");
-    if (!body) return;
-
-    const fileEl = main.querySelector("[data-code-file-name]");
-    const crumbFile = main.querySelector("[data-code-crumb-file]");
-    const crumbDir = main.querySelector("[data-code-crumb-dir]");
-    const crumbCat = main.querySelector("[data-code-crumb-cat]");
-    const iconEl = main.querySelector(".cx-code-tab .cx-rs-ic");
+    const panel = document.querySelector(".cx-code-panel");
+    if (!panel) return;
+    const body = panel.querySelector("[data-code-body]");
+    if (snippetTopicId !== topicIdFromPath(location.pathname) || !isTopicPath(location.pathname)) activeSnippetId = null;
+    const snippet = activeSnippetId ? extractThreadSnippets(document.querySelector(".cx-thread-posts"), snippetTopicId).find(s => s.id === activeSnippetId) : null;
+    const file = snippet ? { path: `snippet-${snippet.postNumber}-${snippet.index + 1}.${extForLang(snippet.lang)}`, language: snippet.lang, content: snippet.code }
+      : activeProject.files.find(f => f.path === activeProjectPath);
     const mode = getCodeMode();
-
-    if (crumbCat) {
-      if (isTopicPath(location.pathname)) {
-        const cat = threadState.categoryId ? categoryById(threadState.categoryId) : null;
-        crumbCat.textContent = (cat && cat.slug) || threadState.slug || "topics";
-      } else {
-        crumbCat.textContent = listTitleForPath(location.pathname);
-      }
+    const signature = JSON.stringify([activeProject.id, openProjectFiles, file?.path, file?.content, mode, snippet?.id]);
+    if (body.dataset.signature === signature) return;
+    rememberCodeScroll();
+    body.dataset.signature = signature;
+    panel.dataset.workspaceId = activeProject.id;
+    panel.querySelector("[data-workspace-name]").textContent = activeProject.name;
+    const tabs = openProjectFiles.map(path => ({ path, label: path.split("/").pop(), active: !snippet && path === activeProjectPath }));
+    if (snippet) tabs.push({ path: "@snippet", label: file.path, active: true });
+    panel.querySelector(".cx-file-tabs").innerHTML = tabs.map(tab => `<div class="cx-code-tab${tab.active ? " cx-active" : ""}"><button role="tab" aria-selected="${tab.active}" data-select-file="${escapeHtml(tab.path)}">${escapeHtml(tab.label)}</button><button data-close-file="${escapeHtml(tab.path)}" aria-label="关闭 ${escapeHtml(tab.label)}">×</button></div>`).join("");
+    panel.querySelector("[data-code-crumb-dir]").textContent = snippet ? "snippets" : file?.path.split("/").slice(0, -1).join(" / ") || activeProject.name;
+    panel.querySelector("[data-code-crumb-file]").textContent = file?.path.split("/").pop() || "";
+    panel.querySelectorAll("[data-code-view-toggle] button").forEach(button => {
+      button.classList.toggle("cx-on", button.dataset.v === mode);
+      button.setAttribute("aria-pressed", String(button.dataset.v === mode));
+      button.disabled = !!snippet && button.dataset.v === "diff";
+    });
+    const actions = panel.querySelector(".cx-snippet-actions");
+    actions.hidden = !snippet;
+    actions.innerHTML = snippet ? `<span>#${snippet.postNumber} · ${snippet.lineCount} 行</span><button data-locate-snippet="${snippet.postNumber}">定位来源</button><button data-copy-snippet="${snippet.id}">复制</button>` : "";
+    body.innerHTML = !file ? '<div class="cx-code-empty">选择文件以打开</div>' : mode === "diff" && !snippet ? fileDiffHtml(file) : codeLinesHtml(file.content, file.language);
+    const scrollKey = `${activeProject.id}:${snippet?.id || file?.path}:${mode}`;
+    body.dataset.scrollKey = scrollKey;
+    const position = codeScrollPositions.get(scrollKey);
+    body.scrollTop = position?.top || 0;
+    body.scrollLeft = position?.left || 0;
+    if (!body.dataset.scrollBound) {
+      body.dataset.scrollBound = "1";
+      body.addEventListener("scroll", rememberCodeScroll, { passive: true });
     }
-
-    main.querySelectorAll("[data-code-view-toggle] span").forEach((x) =>
-      x.classList.toggle("cx-on", x.dataset.v === mode)
-    );
-
-    const isTopic = isTopicPath(location.pathname);
-    const container = document.querySelector(".cx-thread-posts");
-    const snippets = (isTopic && container) ? extractThreadSnippets(container, threadState.topicId) : [];
-
-    // 1. 真实线程中包含代码片段
-    if (isTopic && snippets.length > 0 && !forceDemoCode) {
-      let activeSnippet = snippets.find((s) => s.id === activeSnippetId);
-      if (!activeSnippet) {
-        activeSnippet = snippets[0];
-        activeSnippetId = activeSnippet.id;
-      }
-
-      const ext = extForLang(activeSnippet.lang);
-      const fileName = `snippet-${activeSnippet.postNumber}-${activeSnippet.index + 1}.${ext}`;
-      if (fileEl) fileEl.textContent = fileName;
-      if (crumbFile) crumbFile.textContent = fileName;
-      if (crumbDir) crumbDir.textContent = `${activeSnippet.postNumber}楼代码`;
-      if (iconEl) iconEl.textContent = ext.toUpperCase().slice(0, 2);
-
-      const openLabel = main.querySelector("[data-open-lang-label]");
-      if (openLabel) openLabel.textContent = CODE_LANG_NAMES[activeSnippet.lang] || activeSnippet.lang;
-
-      let selectorHtml = "";
-      if (snippets.length > 1) {
-        selectorHtml = `<div class="cx-snippet-selector" style="padding: 6px 12px; background: var(--cx-wash); border-bottom: 1px solid var(--cx-border); display: flex; gap: 8px; overflow-x: auto; align-items: center; font-size: 12px;">` +
-          snippets.map((s) => {
-            const active = s.id === activeSnippet.id;
-            return `<button type="button" class="cx-snippet-chip${active ? " cx-on" : ""}" data-select-snippet="${s.id}" style="padding: 3px 8px; border-radius: 4px; border: 1px solid ${active ? "var(--cx-brand)" : "var(--cx-border)"}; background: ${active ? "var(--cx-brand)" : "transparent"}; color: ${active ? "#fff" : "var(--cx-text)"}; cursor: pointer; white-space: nowrap;">#${s.postNumber} (${s.lineCount}行)</button>`;
-          }).join("") +
-          `</div>`;
-      }
-
-      const actionsHtml = `<div style="padding: 6px 12px; background: var(--cx-panel-header,#1e1e1e); border-bottom: 1px solid var(--cx-border); display: flex; justify-content: space-between; align-items: center; font-size: 12px;">` +
-        `<div style="color: var(--cx-muted);">来自 #${activeSnippet.postNumber} 楼 · ${activeSnippet.lineCount} 行</div>` +
-        `<div style="display: flex; gap: 8px;">` +
-        `<button class="cx-btn-locate" data-locate-snippet="${activeSnippet.postNumber}" style="padding: 2px 8px; background: transparent; border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; display: flex; align-items: center; gap: 4px;">${ICONS.external}定位来源</button>` +
-        `<button class="cx-btn-copy-snip" data-copy-snippet="${activeSnippet.id}" style="padding: 2px 8px; background: transparent; border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; display: flex; align-items: center; gap: 4px;">${ICONS.copy}复制</button>` +
-        `</div>` +
-        `</div>`;
-
-      if (mode === "code") {
-        const lines = activeSnippet.code.split("\n");
-        const linesHtml = lines.map((ln, i) =>
-          '<div class="cx-cline"><span class="cx-ln">' + (i + 1) + '</span><span class="cx-lc">' + highlightCode(ln, activeSnippet.lang) + "</span></div>"
-        ).join("");
-        body.innerHTML = selectorHtml + actionsHtml + linesHtml;
-      } else {
-        body.innerHTML = selectorHtml + actionsHtml +
-          `<div style="padding: 32px 16px; text-align: center; color: var(--cx-muted); font-size: 13px;">` +
-          `<div style="margin-bottom: 8px;">ℹ️</div>` +
-          `<div style="margin-bottom: 6px; color: var(--cx-text); font-weight: 500;">单个代码片段暂无历史版本对比</div>` +
-          `<div style="font-size: 12px; line-height: 1.6; margin-bottom: 14px;">此代码片段来源于帖子内容，站点未提供历史修订记录。<br>可切换至示例演示查看真实 diff 计算效果。</div>` +
-          `<button class="cx-btn-switch-demo" style="padding: 4px 12px; background: var(--cx-wash); border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; font-size: 12px;">查看示例 Diff</button>` +
-          `</div>`;
-      }
-      return;
-    }
-
-    // 2. 真实线程已加载楼层无代码片段
-    if (isTopic && !forceDemoCode && snippets.length === 0) {
-      if (fileEl) fileEl.textContent = "无代码片段";
-      if (crumbFile) crumbFile.textContent = "无代码片段";
-      if (crumbDir) crumbDir.textContent = "content";
-      if (iconEl) iconEl.textContent = "TXT";
-
-      body.innerHTML = `
-        <div class="cx-code-empty" style="padding: 48px 20px; text-align: center; color: var(--cx-muted);">
-          <div style="font-size: 28px; margin-bottom: 10px;">📄</div>
-          <div style="font-size: 13px; font-weight: 500; margin-bottom: 6px; color: var(--cx-text);">已加载内容中暂无代码片段</div>
-          <div style="font-size: 12px; line-height: 1.6; margin-bottom: 16px;">当前已加载的楼层中未包含代码块。<br>向下滚动加载更多回复，或切换至示例演示模式。</div>
-          <button class="cx-btn-switch-demo" style="padding: 6px 14px; background: var(--cx-wash); border: 1px solid var(--cx-border); border-radius: 6px; color: var(--cx-text); cursor: pointer; font-size: 12px;">切换到示例演示</button>
-        </div>`;
-      return;
-    }
-
-    // 3. 示例演示模式（非随机，真实文本 diff 计算）
-    const demoFileName = "TopicService.ts";
-    if (fileEl) fileEl.textContent = demoFileName;
-    if (crumbFile) crumbFile.textContent = demoFileName;
-    if (crumbDir) crumbDir.textContent = "src/services";
-    if (iconEl) iconEl.textContent = "TS";
-    const openLabel = main.querySelector("[data-open-lang-label]");
-    if (openLabel) openLabel.textContent = "TypeScript";
-
-    const demoBanner = isTopic ? `
-      <div style="padding: 6px 12px; background: var(--cx-wash); border-bottom: 1px solid var(--cx-border); display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--cx-muted);">
-        <span>示例演示模式 (本地静态数据)</span>
-        <button class="cx-btn-exit-demo" style="padding: 2px 6px; background: transparent; border: 1px solid var(--cx-border); border-radius: 4px; color: var(--cx-text); cursor: pointer; font-size: 11px;">返回真实片段</button>
-      </div>` : "";
-
-    if (mode === "code") {
-      const lines = DEMO_CODE_AFTER.split("\n");
-      body.innerHTML = demoBanner + lines.map((ln, i) =>
-        '<div class="cx-cline"><span class="cx-ln">' + (i + 1) + '</span><span class="cx-lc">' + highlightCode(ln, "typescript") + "</span></div>"
-      ).join("");
-    } else {
-      const diff = computeTextDiff(DEMO_CODE_BEFORE, DEMO_CODE_AFTER);
-      const rows = [
-        ["meta", `diff --git a/src/services/${demoFileName} b/src/services/${demoFileName}`],
-        ["meta", `--- a/src/services/${demoFileName} (before)`],
-        ["meta", `+++ b/src/services/${demoFileName} (after)`],
-        ["meta", `@@ +${diff.additions} -${diff.deletions} @@`]
-      ];
-
-      for (const hunk of diff.hunks) {
-        rows.push(["hunk", hunk.header]);
-        for (const line of hunk.lines) {
-          const sign = line.kind === "add" ? "+" : line.kind === "del" ? "-" : " ";
-          const lnNo = line.kind === "del" ? String(line.oldLineNo) : String(line.newLineNo || "");
-          rows.push([line.kind, sign + " " + line.text, lnNo]);
-        }
-      }
-
-      body.innerHTML = demoBanner + rows.map(([kind, ln, lnNo], n) => {
-        const isHead = kind === "meta" || kind === "hunk";
-        const num = isHead ? "" : (lnNo || String(n));
-        const sign = ln.startsWith("+") ? "+ " : ln.startsWith("-") ? "- " : "  ";
-        const textContent = isHead ? escapeHtml(ln) : sign + highlightCode(ln.slice(2), "typescript");
-        const cls = kind ? " cx-" + kind : "";
-        return '<div class="cx-cline' + cls + '"><span class="cx-ln">' + num + '</span><span class="cx-lc">' + textContent + "</span></div>";
-      }).join("");
-    }
+    panel.querySelector("[data-code-status]").textContent = file ? `${file.content.split("\n").length} lines · UTF-8 · LF` : "UTF-8";
+    panel.querySelector("[data-code-language]").textContent = CODE_LANG_NAMES[file?.language] || file?.language || "";
   }
 
   /* ============================== 详情视图（帖子 = agent thread） ============================== */
@@ -6649,159 +7719,79 @@
     return ICONS[FLOOR_ICONS[Math.floor(rnd() * FLOOR_ICONS.length)]] || ICONS.check;
   }
 
-  /** 楼内随机穿插的「工具调用」淡色行（纯装饰；同楼层刷新不变；英文对齐 Codex app） */
-  const RUN_LINES = [
-    ["terminal", "Running command", true],
-    ["file", "Reading file", false],
-    ["search", "Searching codebase", false],
-    ["folder", "Listing directory", false],
-    ["check", "Applied changes", false],
-    ["globe", "Fetched page", false],
-    ["branch", "Pushed commits", false],
-    [null, "Reconnecting", false]
+  // Canned presentation only: never execute commands or insert this text into post.cooked.
+  // Cache by topic/post so pagination and rerenders preserve both choices and disclosure state.
+  const activityByPost = new Map();
+  const THINK_SUMMARIES = [
+    "先梳理入口和调用关系，再检查边界条件。",
+    "从配置和接口约定开始，逐步核对主要实现。",
+    "把正常流程与失败分支分开检查，保持改动范围集中。",
+    "先确认数据如何流转，再对照测试覆盖到的行为。"
   ];
-  const RUN_CMDS = [
-    "cargo build --release", "npm run build", "pytest -q tests/cache",
-    "go test ./...", "git diff --stat", "ls src/", "make lint",
-    "npm test -- --filter=auth", "cargo test --release", "go vet ./...",
-    "docker compose up -d", "kubectl get pods -n prod", "curl -sI https://linux.do"
+  const THINK_NEXT_STEPS = [
+    "接下来检查相关测试中的输入和预期结果。",
+    "整理需要关注的分支，并保留现有接口约定。",
+    "把实现与测试放在一起核对，补齐关键上下文。",
+    "沿着调用顺序继续查看，确认资源的创建与清理位置。"
   ];
 
-  /* 英文思考语料（参考 cli 皮肤 decorationForPost 的素材池） */
-  const THINK_OPENERS = [
-    "Okay, let me think through this properly.",
-    "Alright, reading the post again — the claim hinges on one assumption.",
-    "So the question is essentially about trade-offs, not correctness.",
-    "Hmm, this is more subtle than it first looks.",
-    "The framing is plausible but incomplete — let me reason about why.",
-    "Let me unpack what's actually being claimed here before reacting.",
-    "Interesting — the symptom and the cause are probably two different things.",
-    "Before agreeing, I want to check the failure mode this implies.",
-    "First instinct: this is a config issue masquerading as a bug.",
-    "Let me separate the diagnosis from the proposed fix.",
-    "There's a decent argument on both sides here, which is worth admitting up front.",
-    "The subject line promises one thing; the body asks another.",
-    "I've seen this pattern before — it usually ends up being permissions.",
-    "Reproducing it locally would settle half of this thread instantly.",
-    "I'm going to hold off on an opinion until the key numbers are clear."
-  ];
-  const THINK_MIDS = [
-    "The most likely explanation is resource contention, not the code path itself.",
-    "If the numbers hold under a controlled benchmark, the conclusion is solid; if not, it's measurement noise.",
-    "There are two ways to verify this: profile it under load, or bisect the change.",
-    "I should distinguish between what the author measured and what they inferred.",
-    "The failure mode only shows up under load, which is exactly why it's easy to miss.",
-    "Correlation is doing a lot of work in that argument — worth pointing out gently.",
-    "The simple approach probably wins here; the clever one just moves the complexity.",
-    "Backwards compatibility matters more than elegance in this specific case.",
-    "Queueing delay would explain the tail latency better than throughput.",
-    "The connection pooling detail probably matters more than the language choice.",
-    "Caching is the obvious lever, but it only helps if the read path is actually hot.",
-    "The version pin matters here — half of these reports turn out to be a dependency bump.",
-    "This smells like an ordering problem: the cleanup runs before the flush.",
-    "In practice the config default wins; nobody reads the docs that deeply.",
-    "A single metric won't settle this — I'd want p50 and p99 side by side.",
-    "The author's fix works, but it trades one race condition for a subtler one.",
-    "If this were reproducible in CI, it would already be closed. That absence is itself a signal.",
-    "The right comparison isn't between these two tools, but with the baseline you already trust.",
-    "There's a naming collision lurking in there — prod and dev are using different feature flags.",
-    "Retry logic usually hides the real fault; the first failure is the honest one.",
-    "The throughput story looks good, but the memory graph tells a different one.",
-    "I'd rather recommend the boring solution that survives a teammate leaving.",
-    "Cache invalidation is the unstated dependency in this whole argument.",
-    "The diff is small, but the semantics around the null case changed.",
-    "Reaching for an abstraction here just relocates the special cases.",
-    "Log noise is suspicious: healthy systems fail quietly, not chatty.",
-    "The author is right about the symptom, wrong about the mechanism.",
-    "That timing is too uniform to be network jitter — looks scheduled.",
-    "Concurrent writers would explain both errors, and a transaction would fix both.",
-    "The benchmark lacks a warm-up phase, so the interpreter jit is skewing the first numbers.",
-    "Idempotency handles the retry storm better than a tighter timeout ever will.",
-    "This passes in tests because tests never exercise the actual cross-origin path.",
-    "The dependency was pinned a year ago; the latest release fixed exactly this.",
-    "Two callers assume the same global — that's the actual coupling, not the shared file.",
-    "I can't confirm the root cause without the request headers.",
-    "Better to narrow the scope than to guess at infrastructure.",
-    "The proposal optimizes clean-up but leaves the cold-start path untouched.",
-    "Feature flags are the part that usually ages the worst in these codebases."
-  ];
-const THINK_CLOSERS = [
-    "Let me structure the reply around the one number that matters.",
-    "I'll keep it short and ask the question that actually needs answering.",
-    "I should avoid sounding dismissive — the work is genuinely good.",
-    "Okay, writing it out step by step is the right move here.",
-    "One concrete suggestion beats three abstract ones. Going with that.",
-    "I'll agree with the direction, then flag the one thing that could bite later.",
-    "Better to leave a question than a lecture — keeping the reply to two points.",
-    "Let me lead with the concrete number, then the caveat.",
-    "I'll ask for the reproduction steps before committing to a diagnosis.",
-    "Wrapping up with the fix I'd actually ship, not the one that sounds smart.",
-    "I'll point at the trade-off and let them decide — it's their system.",
-    "Closing with a single question keeps the thread productive.",
-    "I'll keep the tone neutral; the claim is fine, the evidence is thin.",
-    "That's enough analysis — the practical next step is obvious."
-  ];
-
-  /** 英文思考块：head「Worked for Ns」+ 可折叠 body（默认收起静止，带有独立装饰标记） */
-  function buildThinking(rnd) {
-    const secs = 2 + Math.floor(rnd() * 46);
+  function activityForPost(turn) {
+    const pid = Number(turn.dataset.postId || turn.dataset.postNumber || 0);
+    const key = `${threadState.topicId}:${pid}`;
+    if (activityByPost.has(key)) return activityByPost.get(key);
+    const rnd = mulberry32(((pid + 1) * 2654435761 ^ (threadState.topicId || 0)) >>> 0);
     const pick = (pool) => pool[Math.floor(rnd() * pool.length)];
-    // 随机 1-3 句：opener 必有，中段 0-1 句，closer 六成概率出现
-    const sentences = [pick(THINK_OPENERS)];
-    if (rnd() < 0.65) sentences.push(pick(THINK_MIDS));
-    if (rnd() < 0.6) sentences.push(pick(THINK_CLOSERS));
-    const div = document.createElement("div");
-    div.className = "cx-think";
-    div.dataset.codexDecorative = "1";
-    div.innerHTML =
-      `<div class="cx-think-head"><span class="spin">✻</span><span>Worked for ${secs}s</span><span class="cx-think-chev"></span></div>` +
-      `<div class="cx-think-body">${escapeHtml(sentences.join("\n\n"))}</div>`;
-    div.querySelector(".cx-think-head").addEventListener("click", () => {
-      div.classList.toggle("open");
+    const files = activeProject.files;
+    const first = files[Math.floor(rnd() * files.length)];
+    const second = pick(files.filter(file => file !== first));
+    const inspected = rnd() < 0.5 ? [first] : [first, second];
+    const directory = files[0].path.split("/").slice(0, -1).join("/");
+    const activity = {
+      seconds: 4 + Math.floor(rnd() * 38),
+      thought: `${pick(THINK_SUMMARIES)}\n\n查看 ${activeProject.name} 中的 ${first.path}。${pick(THINK_NEXT_STEPS)}`,
+      tools: inspected.map(file => ({
+        icon: "file", label: `读取 ${file.path}`,
+        output: file.content.split("\n").slice(0, 5).join("\n")
+      })),
+      thoughtOpen: false,
+      toolsOpen: false
+    };
+    activity.tools.push({
+      icon: "terminal", label: `rg --files ${directory}`,
+      output: files.filter(file => file.path.startsWith(directory + "/")).map(file => file.path).join("\n")
     });
-    return div;
+    activityByPost.set(key, activity);
+    if (activityByPost.size > 300) activityByPost.delete(activityByPost.keys().next().value);
+    return activity;
+  }
+
+  function buildActivityDisclosure(className, label, body, activity, stateKey) {
+    const details = document.createElement("details");
+    details.className = className;
+    details.open = activity[stateKey];
+    details.innerHTML = `<summary><span class="cx-activity-chevron">${ICONS.chevronRightSm}</span><span>${escapeHtml(label)}</span></summary>${body}`;
+    details.addEventListener("toggle", () => { activity[stateKey] = details.open; });
+    return details;
   }
 
   function sprinkleActivity(holder) {
     if (!holder) return;
     const prefs = readPresentationPrefs();
-    if (!prefs.showThinking && !prefs.showRunlines && !prefs.demoMode) {
-      return;
-    }
+    const thinking = prefs.showThinking || prefs.demoMode;
+    const tools = prefs.showRunlines || prefs.demoMode;
+    if (!thinking && !tools) return;
     holder.querySelectorAll(".cx-turn-agent > .cx-cooked").forEach((cooked) => {
-      const turn = cooked.closest(".cx-turn-agent");
-      if (!turn || turn.dataset.sprinkled === "1") return;
-      turn.dataset.sprinkled = "1";
-      const pid = Number(turn.dataset.postId || 0);
-      const no = Number(turn.dataset.postNumber || 0);
-      const kids = [...cooked.children];
-      if (!kids.length) return;
-      const rnd = mulberry32((((pid || no * 7919) + 1) * 2654435761 ^ (threadState.topicId || 0)) >>> 0);
-      if (prefs.showThinking || prefs.demoMode) {
-        if (rnd() < 0.70) {
-          cooked.prepend(buildThinking(rnd));
-        }
-      }
-      if (!prefs.showRunlines && !prefs.demoMode) return;
-      if (rnd() < 0.72) return;
-      const n = rnd() < 0.22 ? 2 : 1;
-      const used = new Set();
-      for (let k = 0; k < n; k++) {
-        let li = Math.floor(rnd() * RUN_LINES.length);
-        if (used.has(li)) li = (li + 1) % RUN_LINES.length;
-        used.add(li);
-        const [icon, text, withCmd] = RUN_LINES[li];
-        const el = document.createElement("div");
-        el.className = "cx-runline";
-        el.dataset.codexDecorative = "1";
-        el.innerHTML =
-          (icon ? ICONS[icon] : "") +
-          `<span>${text}${icon === null ? ` ${1 + Math.floor(rnd() * 4)}/${2 + Math.floor(rnd() * 4)}` : ""}</span>` +
-          (withCmd ? `<code>${escapeHtml(RUN_CMDS[Math.floor(rnd() * RUN_CMDS.length)])}</code>` : "");
-        const at = Math.min(kids.length, Math.max(1, Math.floor(rnd() * kids.length + 1)));
-        kids[at - 1].insertAdjacentElement("afterend", el);
-        kids.splice(at, 0, el);
-      }
+      const turn = cooked.parentElement;
+      if (turn.dataset.ownReply === "1" || turn.querySelector(".cx-turn-activity")) return;
+      const activity = activityForPost(turn);
+      const wrapper = document.createElement("div");
+      wrapper.className = "cx-turn-activity";
+      wrapper.dataset.codexDecorative = "1";
+      if (thinking) wrapper.appendChild(buildActivityDisclosure("cx-think", `思考了 ${activity.seconds} 秒`,
+        `<div class="cx-think-body">${escapeHtml(activity.thought)}</div>`, activity, "thoughtOpen"));
+      if (tools) wrapper.appendChild(buildActivityDisclosure("cx-tools", `已浏览 ${activity.tools.length - 1} 个文件 · 1 次目录检索`,
+        `<div class="cx-tools-body">${activity.tools.map(tool => `<div class="cx-runline"><div class="cx-runline-label">${ICONS[tool.icon]}<span>${escapeHtml(tool.label)}</span>${ICONS.check}</div><pre>${escapeHtml(tool.output)}</pre></div>`).join("")}</div>`, activity, "toolsOpen"));
+      turn.insertBefore(wrapper, cooked);
     });
   }
 
@@ -6821,7 +7811,7 @@ const THINK_CLOSERS = [
   /** 回帖 = 全宽 agent turn + worked 状态行（操作按钮同行右端，hover 显现） */
   function agentTurnHtml(post) {
     return `
-      <div class="cx-turn-agent" data-post-number="${post.post_number}"${post.id ? ` data-post-id="${post.id}"` : ""}>
+      <div class="cx-turn-agent" data-post-number="${post.post_number}"${post.id ? ` data-post-id="${post.id}"` : ""}${post.username && post.username === getCurrentUsername() ? ' data-own-reply="1"' : ""}>
         <div class="cx-cooked">${post.cooked || ""}</div>
       </div>
       <div class="cx-worked">
@@ -6871,14 +7861,16 @@ const THINK_CLOSERS = [
   }
 
   async function loadTopic(topicId, force) {
-    if (!topicId) return;
+    if (!topicId || !isThemeActive()) return;
     const reqKey = `topic:${topicId}`;
-    if (!force && topicCoordinator.loadedKey === reqKey && threadState.topicId === topicId) {
+    if (!force && topicCoordinator.activeKey === reqKey && ["loading", "error"].includes(topicCoordinator.status)) return;
+    if (!force && topicCoordinator.activeKey === reqKey && topicCoordinator.loadedKey === reqKey && threadState.topicId === topicId) {
       syncAppChrome();
       return;
     }
 
     const req = topicCoordinator.begin(reqKey);
+    const ownerPage = location.pathname;
     threadState.loading = true;
     threadState.postsByNum = {};
     clearQuoteJumpHistory();
@@ -6890,7 +7882,7 @@ const THINK_CLOSERS = [
 
     try {
       const data = await api(`/t/${topicId}.json`, undefined, req.signal);
-      if (!req.isCurrent() || !isThemeActive()) return;
+      if (!req.isCurrent() || !isThemeActive() || location.pathname !== ownerPage) return;
 
       threadState.topicId = topicId;
       topicCoordinator.succeed(req.requestId, reqKey);
@@ -6930,14 +7922,13 @@ const THINK_CLOSERS = [
         loadCategories().then(() => {
           if (req.isCurrent() && isThemeActive()) {
             syncAppChrome({ title: threadState.title });
-            codePanelLastSig = "";
             renderCodePanel();
           }
         });
       }
     } catch (err) {
       if (err && err.name === "AbortError") return;
-      if (!req.isCurrent() || !isThemeActive()) return;
+      if (!req.isCurrent() || !isThemeActive() || location.pathname !== ownerPage) return;
       topicCoordinator.fail(req.requestId, reqKey, err);
       if (box) {
         box.innerHTML = `
@@ -6959,6 +7950,10 @@ const THINK_CLOSERS = [
       if (req.isCurrent()) {
         threadState.loading = false;
       }
+    }
+    const targetPost = /\/\d+\/(\d+)\/?$/.exec(ownerPage)?.[1];
+    if (targetPost && req.isCurrent() && isThemeActive() && location.pathname === ownerPage && topicCoordinator.status === "ready") {
+      await jumpToSource(Number(targetPost));
     }
   }
 
@@ -7126,7 +8121,12 @@ const THINK_CLOSERS = [
   }
 
   function syncCxMode() {
-    document.documentElement.classList.toggle("codex-light", !isDarkMode());
+    setRootClass("codex-light", !isDarkMode());
+  }
+
+  function setRootClass(name, enabled) {
+    const classes = document.documentElement.classList;
+    if (classes.contains(name) !== enabled) classes.toggle(name, enabled);
   }
 
   /** 左下角明暗切换按钮：深色显示太阳（点击转亮），浅色显示月亮 */
@@ -7138,44 +8138,42 @@ const THINK_CLOSERS = [
     btn.title = dark ? "切换到光明模式" : "切换到黑暗模式";
   }
 
-  function removeApp() {
-    closeNotifMenu();
-    document.querySelector(".codex-main")?.remove();
-    document.querySelector(".codex-rail")?.remove();
-  }
-
   /** 低频率轮询 CF 盾状态：命中回退原皮，通过恢复套皮（与 applyTheme 的即时判断互补） */
   function startCfWatcher() {
     if (window.__codexCfWatch) return;
     window.__codexCfWatch = setInterval(() => {
-      const blocked = cfBlocked();
-      const active = document.documentElement.classList.contains(ROOT_CLASS);
-      if (blocked && active) {
-        document.documentElement.classList.remove(ROOT_CLASS, LOCK_CLASS, "codex-topic-open", "codex-rail-open");
-        removeApp();
-      } else if (!blocked && !active && !otherThemeActive()) {
-        applyTheme();
+      if (shouldBypassTheme()) {
+        suspendTheme();
+      } else if (!isThemeActiveState) {
+        bootstrap();
       }
     }, 1500);
   }
 
-  function applyTheme() {
-    if (cfBlocked()) {
-      // 整页被 CF 挑战拦截：停用回原皮（不注入 UI），挑战通过后 watcher 复检自动恢复
-      document.documentElement.classList.remove(ROOT_CLASS, LOCK_CLASS, "codex-topic-open", "codex-rail-open");
-      removeApp();
-      return;
+  function suspendTheme() {
+    teardownTheme();
+    if (nativeModeRequested()) {
+      clearInterval(window.__codexCfWatch);
+      window.__codexCfWatch = null;
+      renderNativeBypassBar();
     }
-    if (otherThemeActive()) {
-      // 飞书 / IDEA 主题在跑：全程避让，恢复原样
-      document.documentElement.classList.remove(ROOT_CLASS, LOCK_CLASS, "codex-topic-open", "codex-rail-open");
-      removeApp();
+  }
+
+  function applyTheme() {
+    if (shouldBypassTheme()) {
+      suspendTheme();
       return;
     }
 
+    if (!isThemeActiveState) {
+      saveOriginalChrome();
+      isThemeActiveState = true;
+      startReadTracking();
+    }
+    invalidatePageRequests();
     injectStyle();
     syncCxMode();
-    document.documentElement.classList.add(ROOT_CLASS);
+    setRootClass(ROOT_CLASS, true);
     makeFavicon();
     applySplash();
     if (!document.body) return;
@@ -7183,16 +8181,20 @@ const THINK_CLOSERS = [
     const pathname = location.pathname;
     const isTopic = isTopicPath(pathname);
     const isHome = isHomePath(pathname);
-    const supported = isTopic || isHome;
+    const isSearch = isSearchPath(pathname);
+    const supported = isTopic || isHome || isSearch;
 
-    document.documentElement.classList.toggle(LOCK_CLASS, supported);
-    document.documentElement.classList.toggle("codex-topic-open", isTopic);
+    setRootClass(LOCK_CLASS, supported);
+    setRootClass("codex-topic-open", isTopic);
 
     ensureRail();
     bindRailClicks();
 
     if (!supported) {
-      // 非列表/帖子路由（设置、消息、搜索等）：rail 常驻，主区交还原生页面
+      // 设置、消息等路由：rail 常驻，主区交还原生页面
+      rememberCodeScroll();
+      closeWorkspaceMenu();
+      cxClosePop();
       document.querySelector(".codex-main")?.remove();
       renderRailDynamic();
       return;
@@ -7201,7 +8203,10 @@ const THINK_CLOSERS = [
     ensureMain();
     bindRailClicks();
 
-    if (isTopic) {
+    if (isSearch) {
+      showView("search");
+      syncSearchView();
+    } else if (isTopic) {
       showView("detail");
       // 进帖子：保留当前列表，仅详情区加载（列表为空则后台补一份 latest 供 rail 分组用）
       if (listState.topics.length && listState.apiPath) {
@@ -7225,6 +8230,8 @@ const THINK_CLOSERS = [
 
   let scheduled = false;
   function scheduleApply() {
+    // History updates invalidate owners synchronously, before the next animation frame.
+    invalidatePageRequests();
     if (scheduled) return;
     scheduled = true;
     requestAnimationFrame(() => {
@@ -7255,25 +8262,31 @@ const THINK_CLOSERS = [
     return true;
   }
 
+  let themeListenersBound = false;
   function bootstrap() {
     if (!document.documentElement) {
       setTimeout(bootstrap, 0);
       return;
     }
-    startCfWatcher(); // 无论当前是否被 CF 拦截，都先挂上恢复/回退轮询
-    injectStyle();
-    if (!otherThemeActive()) {
-      syncCxMode();
-      document.documentElement.classList.add(ROOT_CLASS);
-      makeFavicon(); // document-start 尽早换标，减少未聚焦标签仍显示原 icon
+    // Explicit native mode exits before styles, observers and read tracking are started.
+    if (shouldBypassTheme()) {
+      suspendTheme();
+      if (!nativeModeRequested()) startCfWatcher();
+      return;
     }
+    startCfWatcher();
+    if (themeListenersBound) {
+      applyTheme();
+      return;
+    }
+    themeListenersBound = true;
     restoreColumnWidths(); // 恢复用户拖出的三栏宽度
 
     // 标签重新可见时再刷一次（部分浏览器未聚焦时会缓存旧 favicon）
     if (!window.__codexFaviconVisibilityBound) {
       window.__codexFaviconVisibilityBound = true;
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible" && !otherThemeActive()) {
+        if (document.visibilityState === "visible" && isThemeActive()) {
           makeFavicon();
         }
       });
@@ -7281,16 +8294,13 @@ const THINK_CLOSERS = [
 
     const CODEX_UI_SEL =
       ".codex-rail, .codex-main, #linuxdo-codex-theme, .codex-user-menu-float, " +
-      "#reply-control, .codex-unlock-header, #codex-unlock-header, #codex-temp-reply-click, #codex-unlock-for-reply";
-    let cleanupDone = false;
+      "#reply-control, .codex-unlock-header, #codex-unlock-header, #codex-temp-reply-click, #codex-unlock-for-reply, " +
+      "#codex-native-restore-btn, #codex-favicon, link[data-codex-shortcut='1']";
+    const externalRootClasses = value => String(value || "").split(/\s+/).filter(c => c && !c.startsWith("codex-")).sort().join(" ");
     const observer = new MutationObserver((mutations) => {
-      // 其它主题脚本激活 → 立刻避让（持续观察 html class / style 节点）
-      if (otherThemeActive()) {
-        if (!cleanupDone) {
-          cleanupDone = true;
-          scheduleApply();
-          setTimeout(() => { cleanupDone = false; }, 300);
-        }
+      // Check conflicts before filtering our own writes; never swallow another theme.
+      if (shouldBypassTheme()) {
+        suspendTheme();
         return;
       }
       // 忽略我们自己 UI 内部的 DOM 变动，否则渲染会触发 applyTheme 死循环；
@@ -7300,8 +8310,13 @@ const THINK_CLOSERS = [
         if (!(t instanceof Element) && !(t instanceof CharacterData)) return true;
         const el = t instanceof Element ? t : t.parentElement;
         if (!el) return true;
-        if (m.type === "attributes" && el !== document.documentElement) return false;
+        if (m.type === "attributes") {
+          if (el !== document.documentElement) return false;
+          return externalRootClasses(m.oldValue) !== externalRootClasses(el.className);
+        }
         if (el.closest(CODEX_UI_SEL)) return false;
+        // Appending/removing our UI reports its parent (body/head), not the UI node.
+        if (m.type === "childList" && [...m.addedNodes, ...m.removedNodes].every(n => n instanceof Element && n.matches(CODEX_UI_SEL))) return false;
         return true;
       });
       if (external) scheduleApply();
@@ -7310,6 +8325,7 @@ const THINK_CLOSERS = [
       childList: true,
       subtree: true,
       attributes: true,
+      attributeOldValue: true,
       attributeFilter: ["class"]
     });
 
@@ -7330,7 +8346,7 @@ const THINK_CLOSERS = [
     // 定时同步铃铛蓝点 / 用户名（currentUser 未读数会变）
     if (!window.__codexNotifBadgeTimer) {
       window.__codexNotifBadgeTimer = setInterval(() => {
-        if (otherThemeActive()) return;
+        if (!isThemeActive()) return;
         if (!document.querySelector(".codex-rail")) return;
         syncRail();
       }, 15000);
@@ -7339,24 +8355,23 @@ const THINK_CLOSERS = [
     // 点击原生回复面板以外区域自动收起
     bindOutsideCloseComposer();
 
-    // 阅读进度上报（自渲染流按可见楼层累计，刷新未读计数）
-    startReadTracking();
-
     // ⌘/Ctrl+K → 原生搜索
     window.addEventListener("keydown", (e) => {
       if (!shouldHandleKeyboardShortcut(e, "k")) return;
       if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
-      if (otherThemeActive()) return;
+      if (!isThemeActive()) return;
       e.preventDefault();
       e.stopPropagation();
       openNativeSearch();
     }, true);
 
-    scheduleApply();
+    applyTheme();
   }
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
+      CODE_PROJECTS,
+      fileDiffHtml,
       tokenizeCode,
       highlightCode,
       escapeHtml,

@@ -34,9 +34,14 @@ test("presentation: replies have stable, keyboard accessible activity outside or
   await page.keyboard.press("Enter");
   assert.equal(await thinking.evaluate(el => el.open), true);
   const tools = turn.locator("details.cx-tools");
-  await tools.locator("summary").click();
+  await tools.locator(":scope > summary").click();
   assert.equal(await tools.evaluate(el => el.open), true);
   assert.match(await tools.innerText(), /src\/client.ts/);
+  const command = tools.locator("details.cx-runline").first();
+  assert.equal(await command.locator("pre").isVisible(), false);
+  await command.locator("summary").focus();
+  await page.keyboard.press("Space");
+  assert.equal(await command.locator("pre").isVisible(), true);
   const counts = await page.evaluate(() => [__harness.requests.length, __harness.frames]);
   await settle(page, 350);
   assert.deepEqual(await page.evaluate(() => [__harness.requests.length, __harness.frames]), counts, "activity stays idle");
@@ -47,16 +52,111 @@ test("presentation: replies have stable, keyboard accessible activity outside or
   await hasText(page, ".cx-thread-posts", "第 2 条原始回复");
   assert.equal(await thinking.evaluate(el => el.open), true);
   assert.equal(await tools.evaluate(el => el.open), true);
+  assert.equal(await command.evaluate(el => el.open), true, "individual command disclosure survives rerender");
   assert.equal(await turn.locator(".cx-cooked").innerHTML(), original);
   await thinking.locator("summary").click();
-  await tools.locator("summary").click();
+  await tools.locator(":scope > summary").click();
   assert.equal(await turn.locator(".cx-turn-activity").innerText(), activity);
   assert.equal(await page.locator(".cx-turn-activity").count(), 3);
+});
+
+test("presentation: activity follows compact Codex rows and truncates long commands without losing output", async t => {
+  const page = await openThread(t, { width: 390 });
+  const tools = page.locator(".cx-tools").first();
+  const summary = tools.locator(":scope > summary");
+  assert.match(await summary.innerText(), /运行了命令|已使用 Codey Fastctx 集成/);
+  assert.match(await page.locator(".cx-think > summary").first().innerText(), /^用时 \d+秒$/);
+  const icon = await summary.locator(".cx-activity-icon").boundingBox();
+  const text = await summary.locator(".cx-activity-label").boundingBox();
+  const chevron = await summary.locator(".cx-activity-chevron").boundingBox();
+  assert.ok(icon.x < text.x && text.x + text.width <= chevron.x + 1, "icon precedes text and chevron follows it");
+  await summary.click();
+  const command = tools.locator("details.cx-runline").first();
+  const label = command.locator(".cx-activity-label");
+  assert.match(await label.innerText(), /^已在 \d+s 内运行 /);
+  assert.equal(await label.evaluate(el => getComputedStyle(el).textOverflow), "ellipsis");
+  assert.equal(await label.getAttribute("title"), await label.innerText(), "full command is available on hover");
+  const hiddenCount = await page.locator(".cx-runline[open]").count();
+  assert.equal(hiddenCount, 0);
+  await command.locator("summary").click();
+  assert.equal(await command.locator("pre").isVisible(), true);
+  assert.match(await command.locator("pre").innerText(), /Get-Content/);
+  assert.equal(await page.locator(".cx-runline[open]").count(), 1, "command outputs expand independently");
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 });
 
 test("presentation: explicit disabled preferences remain disabled", async t => {
   const page = await openThread(t, { presentationPrefs: { showThinking: false, showRunlines: false } });
   assert.equal(await page.locator(".cx-turn-activity").count(), 0);
+});
+
+test("presentation: site disclosure styles cannot add leading triangles or stack Codex rows", async t => {
+  for (const mode of ["dark", "light"]) for (const width of [1600, 390]) {
+    const page = await openFixture(t, { route: "/t/client/42", random: 0, rootClass: `${mode}-scheme`, width });
+    const data = conversation();
+    data.post_stream.posts[1].reply_count = 1;
+    data.post_stream.posts[2].reply_to_post_number = 2;
+    data.post_stream.posts[2].cooked += '<details class="original-details"><summary>原帖折叠内容</summary><p>原帖详情保持原样</p></details>';
+    await reply(page, "/t/42.json", data);
+    await page.locator('.cx-reply-branch[data-parent-post="422"]').waitFor();
+    // Load competing site CSS after the actual userscript entry has rendered.
+    await page.addStyleTag({ content: `
+      html body details > summary { display: list-item !important; list-style: disclosure-closed inside !important; }
+      html body details[open] > summary { list-style-type: disclosure-open !important; }
+      html body details > summary::marker { content: "▸ "; }
+      html body details > summary::before { content: "▸"; display: inline-block; }
+      html body details[open] > summary::before { content: "▾"; }
+      html body details > summary::after { content: "▸"; display: inline-block; }
+      html body details > summary > span { display: block; }
+    ` });
+    const turn = page.locator('.cx-turn-agent[data-post-number="2"]');
+    const tools = turn.locator('.cx-tools > summary');
+    await tools.click();
+    const rows = [tools, turn.locator('.cx-think > summary'), turn.locator('.cx-runline > summary').first(),
+      page.locator('.cx-reply-branch[data-parent-post="422"] > summary')];
+    for (const row of rows) {
+      const checkRow = async () => {
+        const styles = await row.evaluate(el => ({
+          display: getComputedStyle(el).display,
+          listStyle: getComputedStyle(el).listStyleType,
+          markers: ["::marker", "::before", "::after"].map(pseudo => getComputedStyle(el, pseudo).content),
+          boxes: [...el.children].map(child => {
+            const { x, y, width, height } = child.getBoundingClientRect();
+            return { x, y, width, height };
+          }),
+        }));
+        assert.equal(styles.display, "flex", "site CSS must not restore list-item layout");
+        assert.equal(styles.listStyle, "none");
+        assert.ok(styles.markers.every(content => content === "none" || content === '""'), "no extra pseudo-element triangles");
+        for (let i = 1; i < styles.boxes.length; i++) {
+          const a = styles.boxes[i - 1], b = styles.boxes[i];
+          assert.ok(a.x + a.width <= b.x + 1, "icon, label and trailing chevron remain in order");
+          assert.ok(Math.abs(a.y + a.height / 2 - b.y - b.height / 2) < 1, "all parts stay on the same row");
+        }
+      };
+      await checkRow();
+      const wasOpen = await row.evaluate(el => el.parentElement.open);
+      await row.focus();
+      await page.keyboard.press("Enter");
+      assert.equal(await row.evaluate(el => el.parentElement.open), !wasOpen);
+      await checkRow();
+      await page.keyboard.press("Space");
+      assert.equal(await row.evaluate(el => el.parentElement.open), wasOpen);
+    }
+    const original = page.locator('.cx-turn-agent[data-post-number="3"] .original-details > summary');
+    assert.equal(await original.evaluate(el => getComputedStyle(el).display), "list-item", "original post disclosures keep site styling");
+    assert.equal(await original.evaluate(el => getComputedStyle(el, "::before").content), '"▸"');
+    await original.click();
+    assert.equal(await original.evaluate(el => el.parentElement.open), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    if (process.env.CODEX_SCREENSHOT_DIR) {
+      fs.mkdirSync(process.env.CODEX_SCREENSHOT_DIR, { recursive: true });
+      await rows[3].click();
+      await tools.scrollIntoViewIfNeeded();
+      await tools.evaluate(el => el.blur());
+      await page.screenshot({ path: path.join(process.env.CODEX_SCREENSHOT_DIR, `disclosure-${mode}-${width}.png`) });
+    }
+  }
 });
 
 test("presentation: activity visibility alone never reports a post as read", async t => {
@@ -66,7 +166,8 @@ test("presentation: activity visibility alone never reports a post as read", asy
   await hasText(page, ".cx-thread-posts", "第 2 条原始回复");
   await page.setViewportSize({ width: 900, height: 480 });
   const turn = page.locator('.cx-turn-agent[data-post-number="2"]');
-  await turn.locator(".cx-tools summary").click();
+  await turn.locator(".cx-tools > summary").click();
+  for (const summary of await turn.locator(".cx-runline > summary").all()) await summary.click();
   await turn.evaluate(el => {
     const scroller = el.closest(".cx-view-detail");
     scroller.scrollTop += el.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
@@ -135,12 +236,12 @@ test("presentation: thread and expanded composer fit dark/light desktop and mobi
     await page.locator(".cx-format-toggle").evaluate(el => el.blur());
     if (process.env.CODEX_SCREENSHOT_DIR) {
       fs.mkdirSync(process.env.CODEX_SCREENSHOT_DIR, { recursive: true });
-      if (width === 1600) await page.locator(".cx-think summary").first().click();
       await page.screenshot({ path: path.join(process.env.CODEX_SCREENSHOT_DIR, `thread-${mode}-${width}.png`) });
-      if (width === 1600) {
-        await page.locator(".cx-tools summary").first().click();
-        await page.locator(".cx-format-toggle").click();
+      if (width === 1600 || width === 390) {
+        await page.locator(".cx-tools > summary").first().click();
         await page.screenshot({ path: path.join(process.env.CODEX_SCREENSHOT_DIR, `thread-tools-${mode}-${width}.png`) });
+        await page.locator(".cx-runline > summary").first().click();
+        await page.screenshot({ path: path.join(process.env.CODEX_SCREENSHOT_DIR, `thread-command-${mode}-${width}.png`) });
       }
     }
   }

@@ -382,6 +382,7 @@
   function invalidatePageRequests(force = false) {
     if (!force && requestPage === pageRequestKey()) return;
     requestPage = pageRequestKey();
+    if (cxPopEl?.classList.contains("cx-user-card")) cxClosePop();
     listCoordinator.cancel();
     listMoreCoordinator.cancel();
     topicCoordinator.cancel();
@@ -1024,8 +1025,12 @@
   ];
   let cxPopEl = null;
   let cxPopOutsideClose = null;
+  let cxPopCleanup = null;
   function cxClosePop() {
     if (!cxPopEl) return;
+    const cleanup = cxPopCleanup;
+    cxPopCleanup = null;
+    cleanup?.();
     cxPopEl.remove();
     cxPopEl = null;
     if (cxPopOutsideClose) {
@@ -1044,12 +1049,83 @@
     const top = Math.max(8, rect.top - cxPopEl.offsetHeight - 8);
     cxPopEl.style.left = left + "px";
     cxPopEl.style.top = top + "px";
-    cxPopEl.addEventListener("mousedown", (e) => e.preventDefault());
+    cxPopEl.addEventListener("mousedown", (e) => {
+      if (!cxPopEl?.classList.contains("cx-user-card")) e.preventDefault();
+    });
     cxPopOutsideClose = (e) => {
-      if (!cxPopEl?.contains(e.target)) cxClosePop();
+      if (!cxPopEl?.contains(e.target) && !(cxPopEl?.classList.contains("cx-user-card") && btn.contains(e.target))) cxClosePop();
     };
     document.addEventListener("mousedown", cxPopOutsideClose);
   }
+  function authorLink(post, className = "") {
+    const name = post.name || post.username || "用户";
+    if (!post.username) return `<span class="${className}">${escapeHtml(name)}</span>`;
+    return `<a class="cx-author-link ${className}" href="/u/${encodeURIComponent(post.username)}" data-cx-user="${escapeHtml(post.username)}" aria-haspopup="dialog">${escapeHtml(name)}</a>`;
+  }
+
+  async function openAuthorCard(anchor) {
+    const username = anchor.dataset.cxUser;
+    if (!isThemeActive() || !username || cxPopEl?.dataset.username === username) return;
+    cxOpenPop(anchor, "cx-user-card", `<strong class="cx-user-name"></strong><span class="cx-user-handle"></span><div class="cx-user-info" role="status">正在加载资料…</div><a href="/u/${encodeURIComponent(username)}">查看个人主页</a>`);
+    const card = cxPopEl;
+    const position = () => {
+      const rect = anchor.getBoundingClientRect();
+      const above = rect.top - 8;
+      const below = window.innerHeight - rect.bottom - 8;
+      const useAbove = above >= card.offsetHeight || above > below;
+      card.style.maxHeight = `${Math.max(40, (useAbove ? above : below) - 8)}px`;
+      card.style.top = `${useAbove ? Math.max(8, rect.top - card.offsetHeight - 8) : rect.bottom + 8}px`;
+    };
+    card.dataset.username = username;
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-label", `${username} 的资料`);
+    card.querySelector(".cx-user-name").textContent = anchor.textContent;
+    card.querySelector(".cx-user-handle").textContent = `@${username}`;
+    position();
+    const controller = new AbortController();
+    const closeOnEscape = e => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      anchor.focus({ preventScroll: true });
+      cxClosePop();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    cxPopCleanup = () => {
+      controller.abort();
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+    try {
+      const data = await api(`/u/${encodeURIComponent(username)}.json`, undefined, controller.signal);
+      if (cxPopEl !== card || !isThemeActive()) return;
+      const user = data.user;
+      if (!user || String(user.username).toLowerCase() !== username.toLowerCase()) throw new Error("用户不存在");
+      card.querySelector(".cx-user-name").textContent = user.name || user.username;
+      card.querySelector(".cx-user-info").textContent = [user.title, user.location, user.bio_raw].filter(Boolean).join(" · ") || "暂无个人简介";
+      const dates = document.createElement("div");
+      dates.className = "cx-user-info cx-user-dates";
+      for (const [label, value] of [["注册时间", user.created_at], ["最后活动时间", user.last_seen_at]]) {
+        const row = document.createElement("div");
+        row.append(`${label}：`);
+        const date = typeof value === "string" && value.trim() ? new Date(value) : null;
+        if (date && Number.isFinite(date.getTime())) {
+          const time = document.createElement("time");
+          time.dateTime = date.toISOString();
+          time.textContent = date.toLocaleString("zh-CN", {
+            year: "numeric", month: "2-digit", day: "2-digit",
+            hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+          });
+          time.title = "按本地时区显示";
+          row.append(time);
+        } else row.append("未提供");
+        dates.append(row);
+      }
+      card.querySelector(".cx-user-info").after(dates);
+    } catch (error) {
+      if (cxPopEl === card && !controller.signal.aborted) card.querySelector(".cx-user-info").textContent = "资料暂时无法加载，可直接访问主页。";
+    }
+    if (cxPopEl === card) position();
+  }
+
   function cxNativeEmojiPicker(btn, onPick) {
     const owner = getEmberOwner();
     const menu = owner && safeLookup(owner, "service:menu");
@@ -2808,6 +2884,12 @@
     .cx-branch-reply { padding: 12px 0; min-width: 0; }
     .cx-branch-reply + .cx-branch-reply { border-top: 1px solid var(--cx-border-soft); }
     .cx-branch-reply header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .cx-author-link { color:inherit; text-decoration:none; cursor:pointer; }
+    .cx-author-link:hover, .cx-author-link:focus-visible { color:var(--cx-blue); text-decoration:underline; }
+    .cx-user-card { width:280px; max-width:calc(100vw - 16px); max-height:calc(100vh - 16px); overflow:auto; display:flex; flex-direction:column; gap:10px; padding:16px; overflow-wrap:anywhere; }
+    .cx-user-handle, .cx-user-info { color:var(--cx-text-dim); font-size:12px; white-space:pre-wrap; }
+    .cx-user-card a { color:var(--cx-blue); }
+    .cx-parent-slot:not(:empty) { margin-top:12px; }
     .cx-branch-author { color: var(--cx-text-secondary); overflow-wrap: anywhere; }
     .cx-branch-reply button, .cx-branch-status button { font: inherit; color: var(--cx-text-dim); background: transparent; border: none; cursor: pointer; padding: 4px 0; }
     .cx-branch-reply button:hover, .cx-branch-status button:hover { color: var(--cx-text); }
@@ -5032,6 +5114,19 @@
     if (main.dataset.eventsBound === "1") return;
     main.dataset.eventsBound = "1";
     bindSearchEvents(main);
+    const showAuthor = e => {
+      const anchor = e.target.closest("[data-cx-user]");
+      if (anchor) openAuthorCard(anchor);
+    };
+    main.addEventListener("mouseover", showAuthor);
+    main.addEventListener("focusin", showAuthor);
+    main.addEventListener("click", e => {
+      const anchor = e.target.closest("[data-cx-user]");
+      if (!anchor || e.button || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openAuthorCard(anchor);
+    }, true);
 
     main.addEventListener("click", (e) => {
       // 窄屏抽屉开关
@@ -7900,7 +7995,7 @@
     if (body.dataset.signature === signature) return;
     body.dataset.signature = signature;
     body.innerHTML = state.posts.map(post => `<article class="cx-branch-reply" data-post-number="${Number(post.post_number)}" data-post-id="${Number(post.id)}">
-      <header><span class="cx-branch-author">@${escapeHtml(post.name || post.username || "用户")}</span><button type="button" data-branch-locate="${Number(post.post_number)}">#${Number(post.post_number)} · 定位原楼</button></header>
+      <header>${authorLink(post, "cx-branch-author")}<button type="button" data-branch-locate="${Number(post.post_number)}">#${Number(post.post_number)} · 定位原楼</button></header>
       <div class="cx-branch-cooked">${post.cooked || ""}</div>
       <button type="button" class="cx-act" data-action="reply" data-post-number="${Number(post.post_number)}">${ICONS.reply}回复</button>
     </article>`).join("");
@@ -7932,7 +8027,15 @@
     for (const slot of box.querySelectorAll(".cx-parent-slot")) {
       const post = threadState.postsByNum[slot.dataset.replyPost];
       const number = Number(post?.reply_to_post_number);
-      if (!Number.isInteger(number) || number < 1 || number >= Number(post.post_number)) continue;
+      if (!Number.isInteger(number) || number < 1 || number >= Number(post?.post_number)) {
+        slot.replaceChildren();
+        delete slot.dataset.parentNumber;
+        continue;
+      }
+      if (slot.dataset.parentNumber !== String(number)) {
+        slot.replaceChildren();
+        slot.dataset.parentNumber = String(number);
+      }
       let state = replyParents.get(number);
       if (!state) {
         state = { number, topicId: threadState.topicId, coordinator: new RequestCoordinator(`parent:${number}`) };
@@ -7952,14 +8055,14 @@
         slot.appendChild(details);
       }
       const name = parent?.name || parent?.username || post.reply_to_user?.username;
-      details.querySelector(".cx-parent-label").textContent = `回复${name ? ` @${name}` : ""} · #${number}`;
+      details.querySelector(".cx-parent-label").textContent = `${post.post_number} 楼回复${name ? ` @${name}` : ""} · #${number}`;
       if (!details.open) continue;
       const body = details.querySelector(".cx-parent-body");
       const signature = JSON.stringify([parent, state.coordinator.status]);
       if (body.dataset.signature === signature) continue;
       body.dataset.signature = signature;
       if (parent) {
-        body.innerHTML = `<article class="cx-branch-reply" data-post-number="${number}" data-post-id="${Number(parent.id)}"><header><span class="cx-branch-author">@${escapeHtml(parent.name || parent.username || "用户")}</span><button type="button" data-branch-locate="${number}">#${number} · 定位原楼</button></header><div class="cx-branch-cooked">${parent.cooked || ""}</div></article>`;
+        body.innerHTML = `<article class="cx-branch-reply" data-post-number="${number}" data-post-id="${Number(parent.id)}"><header>${authorLink(parent, "cx-branch-author")}<button type="button" data-branch-locate="${number}">#${number} · 定位原楼</button></header><div class="cx-branch-cooked">${parent.cooked || ""}</div></article>`;
         decorateCooked(body);
       } else {
         body.innerHTML = state.coordinator.status === "error"
@@ -8144,7 +8247,7 @@
       </div>
       <div class="cx-turn-meta">
         <span class="cx-status-dot cx-done"></span>
-        楼主 · ${escapeHtml(post.name || post.username)} · ${escapeHtml(formatTime(post.created_at))} · 阅读 ${threadState.views || "–"}
+        楼主 · ${authorLink(post)} · ${escapeHtml(formatTime(post.created_at))} · 阅读 ${threadState.views || "–"}
         ${turnActionsHtml(post)}
       </div>`;
   }
@@ -8153,12 +8256,12 @@
   function agentTurnHtml(post) {
     return `
       <div class="cx-turn-agent" data-post-number="${post.post_number}"${post.id ? ` data-post-id="${post.id}"` : ""}${post.username && post.username === getCurrentUsername() ? ' data-own-reply="1"' : ""}>
-        <div class="cx-parent-slot" data-reply-post="${Number(post.post_number)}"></div>
         <div class="cx-cooked">${post.cooked || ""}</div>
+        <div class="cx-parent-slot" data-reply-post="${Number(post.post_number)}"></div>
       </div>
       <div class="cx-worked">
         ${floorIcon(post)}
-        ${post.post_number} 楼 · ${escapeHtml(post.name || post.username)} · ${escapeHtml(formatTime(post.created_at))}
+        ${post.post_number} 楼 · ${authorLink(post)} · ${escapeHtml(formatTime(post.created_at))}
         ${turnActionsHtml(post)}
       </div>`;
   }

@@ -23,6 +23,90 @@ async function openThread(t, { data = thread(), ...options } = {}) {
 }
 const branch = page => page.locator('.cx-reply-branch[data-parent-post="422"]');
 
+test("replies: parent context follows its own body and names both floors", async t => {
+  const data = thread();
+  // Public topic 2946712: 8 replies to 6, and 9 replies to 8.
+  const question = '话说一个账号支持同时在几个codex上登录使用啊';
+  const answer = '一般是2个，超过2个就有降智的风险；建议专号 专事儿，';
+  data.post_stream.posts.push(post(6, null),
+    { ...post(8, 6), username: 'wanlan', cooked: `<p>${question}</p>`, reply_count: 1 },
+    { ...post(9, 8), username: 'ndj888', cooked: `<p>${answer}</p>` }, post(10, 10));
+  const page = await openThread(t, { data });
+  const turn = page.locator('.cx-turn-agent[data-post-number="9"]');
+  await hasText(page, '.cx-turn-agent[data-post-number="9"] .cx-parent-label', '9 楼回复 @wanlan · #8');
+  await hasText(page, '.cx-turn-agent[data-post-number="8"] .cx-parent-label', '8 楼回复 @dev6 · #6');
+  await turn.locator('.cx-parent-context summary').click();
+  assert.equal(await turn.locator('.cx-cooked').innerText(), answer);
+  assert.equal(await turn.locator('.cx-parent-body .cx-branch-cooked').innerText(), question);
+  const eighthBranch = page.locator('[data-branch-parent="8"]');
+  await eighthBranch.locator('summary').click();
+  assert.equal(await eighthBranch.locator('.cx-branch-reply').getAttribute('data-post-number'), '9');
+  assert.equal(await eighthBranch.locator('.cx-branch-cooked').innerText(), answer);
+  assert.equal(await turn.evaluate(el => el.querySelector('.cx-cooked').compareDocumentPosition(el.querySelector('.cx-parent-slot')) & Node.DOCUMENT_POSITION_FOLLOWING), 4);
+  assert.equal(await page.locator('.cx-turn-agent[data-post-number="10"] .cx-parent-context').count(), 0);
+});
+
+test("replies: author hover and keyboard open a safe profile card with a real homepage link", async t => {
+  const page = await openThread(t);
+  const author = page.locator('.cx-worked [data-cx-user="dev2"]');
+  assert.equal(await author.getAttribute('href'), '/u/dev2');
+  await author.hover();
+  await reply(page, '/u/dev2.json', { user: { username: 'dev2', name: 'Developer Two', bio_raw: '<img src=x onerror=alert(1)>bio', location: 'Shanghai' } });
+  await hasText(page, '.cx-user-card', 'Developer Two');
+  assert.equal(await page.locator('.cx-user-card img').count(), 0);
+  assert.equal(await page.locator('.cx-user-card a').getAttribute('href'), '/u/dev2');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('.cx-user-card').count(), 0);
+  const next = page.locator('.cx-worked [data-cx-user="dev3"]');
+  await next.focus();
+  await reply(page, '/u/dev3.json', {}, 503);
+  await hasText(page, '.cx-user-card', '资料暂时无法加载');
+  assert.equal(await page.locator('.cx-user-card a').getAttribute('href'), '/u/dev3');
+  await navigate(page, '/new?cx_native=1');
+  await settle(page);
+  assert.equal(await page.locator('.cx-user-card').count(), 0);
+});
+
+test("replies: clicking authors rejects old profile responses after switching and leaving", async t => {
+  const page = await openThread(t);
+  await page.locator('.cx-worked [data-cx-user="dev2"]').click();
+  await waitRequest(page, '/u/dev2.json');
+  await page.locator('.cx-worked [data-cx-user="dev3"]').focus();
+  await reply(page, '/u/dev3.json', { user: { username: 'dev3', name: 'Current author' } });
+  await reply(page, '/u/dev2.json', { user: { username: 'dev2', name: 'Stale author' } });
+  await hasText(page, '.cx-user-card', 'Current author');
+  assert.equal(await page.locator('.cx-user-card').getAttribute('data-username'), 'dev3');
+  await page.keyboard.press('Escape');
+  await page.locator('.cx-worked [data-cx-user="dev2"]').click();
+  await waitRequest(page, '/u/dev2.json', 2);
+  await navigate(page, '/new?cx_native=1');
+  await reply(page, '/u/dev2.json', { user: { username: 'dev2', name: 'Stale author' } });
+  await settle(page);
+  assert.equal(await page.locator('.cx-user-card').count(), 0);
+});
+
+test("replies: profile dates show registration and last seen, with missing or invalid values unavailable", async t => {
+  const page = await openThread(t);
+  await page.locator('.cx-worked [data-cx-user="dev2"]').hover();
+  await reply(page, '/u/dev2.json', { user: {
+    username: 'dev2', created_at: '2023-04-15T06:30:00Z', last_seen_at: '2026-09-24T08:45:00Z'
+  } });
+  await hasText(page, '.cx-user-dates', '注册时间：');
+  await hasText(page, '.cx-user-dates', '最后活动时间：');
+  const times = page.locator('.cx-user-dates time');
+  assert.equal(await times.nth(0).getAttribute('datetime'), '2023-04-15T06:30:00.000Z');
+  assert.equal(await times.nth(1).getAttribute('datetime'), '2026-09-24T08:45:00.000Z');
+  assert.match(await times.nth(0).innerText(), /2023.*04.*15/);
+  assert.match(await times.nth(1).innerText(), /2026.*09.*24/);
+  await page.locator('.cx-worked [data-cx-user="dev3"]').focus();
+  await reply(page, '/u/dev3.json', { user: {
+    username: 'dev3', created_at: 'invalid-date', last_seen_at: null, last_posted_at: '2026-09-24T08:45:00Z'
+  } });
+  await hasText(page, '.cx-user-dates', '注册时间：未提供');
+  await hasText(page, '.cx-user-dates', '最后活动时间：未提供');
+  assert.equal(await page.locator('.cx-user-dates time').count(), 0);
+});
+
 test("replies: a reply exposes its local parent without a request or navigation", async t => {
   const page = await openThread(t);
   const context = page.locator('.cx-turn-agent[data-post-number="3"] .cx-parent-context');

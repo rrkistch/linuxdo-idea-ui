@@ -23,6 +23,44 @@ async function openThread(t, { data = thread(), ...options } = {}) {
 }
 const branch = page => page.locator('.cx-reply-branch[data-parent-post="422"]');
 
+test("replies: a reply exposes its local parent without a request or navigation", async t => {
+  const page = await openThread(t);
+  const context = page.locator('.cx-turn-agent[data-post-number="3"] .cx-parent-context');
+  await hasText(page, '.cx-turn-agent[data-post-number="3"] .cx-parent-label', '回复 @dev2 · #2');
+  await context.locator('summary').focus();
+  await page.keyboard.press('Enter');
+  await hasText(page, '.cx-turn-agent[data-post-number="3"] .cx-parent-context', '建议把取消信号');
+  assert.equal(await requestCount(page, '/t/42/2.json'), 0);
+  await context.locator('[data-branch-locate]').click();
+  await page.locator('.cx-turn-agent[data-post-number="2"].cx-jump-highlight').waitFor();
+});
+
+test("replies: missing parent loads lazily, retries, deduplicates and rejects stale responses", async t => {
+  const data = thread();
+  data.post_stream.posts.push(post(9, 7), post(10, 7));
+  const page = await openThread(t, { data });
+  const context = page.locator('.cx-turn-agent[data-post-number="9"] .cx-parent-context');
+  assert.equal(await requestCount(page, '/t/42/7.json'), 0);
+  await context.locator('summary').click();
+  await page.locator('.cx-turn-agent[data-post-number="10"] .cx-parent-context summary').click();
+  assert.equal(await requestCount(page, '/t/42/7.json'), 1);
+  await reply(page, '/t/42/7.json', {}, 503);
+  await context.getByRole('button', { name: '重试' }).click();
+  await reply(page, '/t/42/7.json', { id: 42, post_stream: { posts: [post(7, null)] } });
+  await hasText(page, '.cx-turn-agent[data-post-number="9"] .cx-parent-context', '跟进 #7');
+  assert.equal(await page.locator('.cx-thread-posts > .cx-turn-agent[data-post-number="7"]').count(), 0);
+  await navigate(page, '/search');
+  await page.locator('.cx-search-input').waitFor();
+  await navigate(page, '/t/client/42');
+  await reply(page, '/t/42.json', data);
+  await context.locator('summary').click();
+  await waitRequest(page, '/t/42/7.json', 3);
+  await navigate(page, '/new?cx_native=1');
+  await reply(page, '/t/42/7.json', { id: 42, post_stream: { posts: [post(7, null)] } });
+  await settle(page);
+  await assertNative(page);
+});
+
 test("replies: local direct replies expand below their parent and retain real reply targets", async t => {
   const data = thread(42, 1);
   data.post_stream.posts.push(post(4, 3));

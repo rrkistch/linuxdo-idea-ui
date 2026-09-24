@@ -7754,9 +7754,12 @@
   }
 
   const replyBranches = new Map();
+  const replyParents = new Map();
   const REPLY_BRANCH_PAGE_SIZE = 20; // Discourse PostsController::MAX_POST_REPLIES
 
   function clearReplyBranches() {
+    for (const state of replyParents.values()) state.coordinator.cancel();
+    replyParents.clear();
     for (const state of replyBranches.values()) state.coordinator.cancel();
     replyBranches.clear();
   }
@@ -7830,10 +7833,78 @@
   function syncReplyBranches() {
     const box = detailContainer();
     if (!box) return;
+    syncReplyParents(box);
     for (const slot of box.querySelectorAll(".cx-branch-slot")) {
       const post = threadState.postsByNum[slot.dataset.branchParent];
       const state = replyBranchState(post);
       if (state) renderReplyBranch(slot, state);
+    }
+  }
+
+  // Reverse reply context is fetched on expansion, without navigating the reader.
+  function syncReplyParents(box) {
+    if (!box) return;
+    for (const slot of box.querySelectorAll(".cx-parent-slot")) {
+      const post = threadState.postsByNum[slot.dataset.replyPost];
+      const number = Number(post?.reply_to_post_number);
+      if (!Number.isInteger(number) || number < 1 || number >= Number(post.post_number)) continue;
+      let state = replyParents.get(number);
+      if (!state) {
+        state = { number, topicId: threadState.topicId, coordinator: new RequestCoordinator(`parent:${number}`) };
+        replyParents.set(number, state);
+      }
+      const parent = threadState.postsByNum[number];
+      let details = slot.firstElementChild;
+      if (!details) {
+        details = document.createElement("details");
+        details.className = "cx-reply-branch cx-parent-context";
+        details.innerHTML = `<summary class="cx-disclosure-summary"><span aria-hidden="true">${ICONS.reply}</span><span class="cx-parent-label"></span><span class="cx-branch-chevron" aria-hidden="true">${ICONS.chevronDown}</span></summary><div class="cx-parent-body cx-branch-body"></div>`;
+        details.addEventListener("toggle", () => {
+          if (!details.isConnected || replyParents.get(number) !== state) return;
+          if (details.open && !threadState.postsByNum[number] && state.coordinator.status === "idle") loadReplyParent(state);
+          else syncReplyParents(box);
+        });
+        slot.appendChild(details);
+      }
+      const name = parent?.name || parent?.username || post.reply_to_user?.username;
+      details.querySelector(".cx-parent-label").textContent = `回复${name ? ` @${name}` : ""} · #${number}`;
+      if (!details.open) continue;
+      const body = details.querySelector(".cx-parent-body");
+      const signature = JSON.stringify([parent, state.coordinator.status]);
+      if (body.dataset.signature === signature) continue;
+      body.dataset.signature = signature;
+      if (parent) {
+        body.innerHTML = `<article class="cx-branch-reply" data-post-number="${number}" data-post-id="${Number(parent.id)}"><header><span class="cx-branch-author">@${escapeHtml(parent.name || parent.username || "用户")}</span><button type="button" data-branch-locate="${number}">#${number} · 定位原楼</button></header><div class="cx-branch-cooked">${parent.cooked || ""}</div></article>`;
+        decorateCooked(body);
+      } else {
+        body.innerHTML = state.coordinator.status === "error"
+          ? '<div class="cx-branch-status" role="status">原回复加载失败或不可见 <button type="button">重试</button></div>'
+          : '<div class="cx-branch-status" role="status">正在加载原回复…</div>';
+        body.querySelector("button")?.addEventListener("click", () => loadReplyParent(state));
+      }
+    }
+  }
+
+  async function loadReplyParent(state) {
+    if (!isThemeActive() || state.coordinator.status === "loading") return;
+    const version = topicCoordinator.currentRequestId;
+    const req = state.coordinator.begin(`parent:${state.topicId}:${state.number}`);
+    const current = () => req.isCurrent() && replyParents.get(state.number) === state &&
+      topicCoordinator.isCurrent(version) && threadState.topicId === state.topicId && isThemeActive();
+    syncReplyParents(detailContainer());
+    try {
+      const data = await api(`/t/${state.topicId}/${state.number}.json`, undefined, req.signal);
+      if (!current()) return;
+      const parent = data.post_stream?.posts?.find(post => Number(post.post_number) === state.number &&
+        (!post.topic_id || Number(post.topic_id) === state.topicId));
+      if (!parent || (data.id && Number(data.id) !== state.topicId)) throw new Error("原回复不可见");
+      threadState.postsByNum[state.number] = parent;
+      state.coordinator.succeed(req.requestId, req.key);
+    } catch (error) {
+      if (!current() || error?.name === "AbortError") return;
+      state.coordinator.fail(req.requestId, req.key, error);
+    } finally {
+      if (current()) preserveThreadViewport(() => syncReplyParents(detailContainer()));
     }
   }
 
@@ -7997,6 +8068,7 @@
   function agentTurnHtml(post) {
     return `
       <div class="cx-turn-agent" data-post-number="${post.post_number}"${post.id ? ` data-post-id="${post.id}"` : ""}${post.username && post.username === getCurrentUsername() ? ' data-own-reply="1"' : ""}>
+        <div class="cx-parent-slot" data-reply-post="${Number(post.post_number)}"></div>
         <div class="cx-cooked">${post.cooked || ""}</div>
       </div>
       <div class="cx-worked">

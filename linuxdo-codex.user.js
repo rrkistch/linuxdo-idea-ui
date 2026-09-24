@@ -1699,6 +1699,8 @@
 
   /** 当前列表路由对应的分类 id（用于新话题 composer 预填分类） */
   function categoryIdFromPath(pathname) {
+    const directId = pathname.match(/^\/c\/(\d+)(?:\/|$)/);
+    if (directId) return Number(directId[1]);
     const idM = pathname.match(/^\/c\/[\w-]+(?:\/[\w-]+)?\/(\d+)/);
     if (idM) return Number(idM[1]);
     const c = pathname.match(/^\/c\/([\w-]+)/);
@@ -1892,6 +1894,10 @@
     .${ROOT_CLASS}.${LOCK_CLASS} .sidebar-wrapper,
     .${ROOT_CLASS}.${LOCK_CLASS} .sidebar-container { display: none !important; }
 
+    .cx-search-scope { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin:-12px 0 20px; padding:10px 12px; border:1px solid var(--cx-border); border-radius:8px; color:var(--cx-text-secondary); font-size:12px; }
+    .cx-search-scope[hidden] { display:none; }
+    .cx-search-scope-label { flex:1; min-width:120px; }
+    .cx-search-scope button { border:0; background:none; color:var(--cx-blue); cursor:pointer; font:inherit; padding:4px; }
     .cx-search-heading { display:flex; align-items:center; gap:14px; margin:8px 0 28px; }
     .cx-search-heading > span { display:grid; place-items:center; width:42px; height:42px; border:1px solid var(--cx-border); border-radius:12px; }
     .cx-search-heading svg { width:20px; height:20px; }
@@ -2205,6 +2211,9 @@
     .codex-topbar .cx-crumb .cx-proj { color: var(--cx-text); cursor: pointer; }
     .codex-topbar .cx-crumb .cx-model { color: var(--cx-text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .codex-topbar .cx-spacer { flex: 1; }
+    .cx-scope-action { display:none; align-items:center; gap:5px; padding:5px 7px; border:0; border-radius:6px; color:var(--cx-text-dim); background:none; font:inherit; font-size:11px; white-space:nowrap; cursor:pointer; }
+    .cx-scope-action:hover { color:var(--cx-text); background:var(--cx-bg-raised); }
+    @media (max-width:600px) { .cx-scope-action span { display:none; } .cx-scope-action { padding:5px; } }
     .codex-topbar .cx-icon-btn {
       padding: 5px;
       border-radius: 6px;
@@ -4701,17 +4710,49 @@
 
   /* ============================== 主区骨架与顶栏 ============================== */
 
-  const searchState = { routeKey: null, query: "", type: "posts", page: 0, items: [], more: false, loading: false, error: "", retryPage: 1 };
+  const searchState = { routeKey: null, query: "", type: "posts", scope: "", id: null, from: "", page: 0, items: [], more: false, loading: false, error: "", retryPage: 1 };
 
   function searchRoute() {
     const params = new URLSearchParams(location.search);
-    return { query: (params.get("q") || "").trim(), type: ["taxonomy", "users"].includes(params.get("type")) ? params.get("type") : "posts" };
+    const type = ["taxonomy", "users"].includes(params.get("type")) ? params.get("type") : "posts";
+    // Use Discourse's declared query params: Ember drops unknown scope/id params.
+    // Continue accepting links made by earlier versions of this script.
+    const nativeContext = params.has("context");
+    const candidate = params.get(nativeContext ? "context" : "scope");
+    const id = Number(params.get(nativeContext ? "context_id" : "id"));
+    const scope = params.get("skip_context") !== "true" && type === "posts" &&
+      ["topic", "category"].includes(candidate) && Number.isSafeInteger(id) && id > 0 ? candidate : "";
+    let from = "";
+    if (scope) {
+      const raw = params.get("from") || "";
+      if (raw.startsWith("/") && !raw.startsWith("//")) {
+        try {
+          const url = new URL(raw, location.origin);
+          if (url.origin === location.origin && (scope === "topic" ? topicIdFromPath(url.pathname) === id : categoryIdFromPath(url.pathname) === id || isTopicPath(url.pathname))) {
+            from = url.pathname + url.search;
+          }
+        } catch { /* use the canonical route below */ }
+      }
+      if (!from) from = scope === "topic" ? `/t/${id}` : `/c/${id}`;
+    }
+    return { query: (params.get("q") || "").trim(), type, scope, id: scope ? id : null, from };
+  }
+
+  function openScopedSearch(scope) {
+    const topic = isTopicPath(location.pathname);
+    const id = scope === "topic" ? (topic ? topicIdFromPath(location.pathname) : null)
+      : topic ? (threadState.topicId === topicIdFromPath(location.pathname) ? threadState.categoryId : null)
+      : categoryIdFromPath(location.pathname);
+    if (!id) return;
+    focusSearchOnOpen = true;
+    navigateSearch("", "posts", { scope, id, from: location.pathname + location.search });
   }
 
   function searchViewHtml() {
     return `<section class="codex-thread cx-view-search" style="display:none" aria-label="搜索工作区">
       <div class="codex-thread-inner">
         <div class="cx-search-heading"><span>${ICONS.search}</span><div><h1>搜索工作区</h1><p>查找话题、分类、标签和成员</p></div><kbd>Ctrl K</kbd></div>
+        <div class="cx-search-scope" hidden><strong class="cx-search-scope-label"></strong><button class="cx-search-return" type="button">返回原处</button><button class="cx-search-global" type="button">全站搜索</button></div>
         <form class="cx-search-form" role="search">
           <div class="cx-search-field"><input class="cx-search-input" type="search" aria-label="搜索关键词" placeholder="搜索… 支持 in:title、after: 等指令" autocomplete="off"><button class="cx-search-submit" type="submit">搜索</button></div>
           <div class="cx-search-filters">
@@ -4741,10 +4782,19 @@
     return query.trim();
   }
 
-  function navigateSearch(query, type) {
+  function navigateSearch(query, type, context = searchRoute()) {
     const params = new URLSearchParams();
     if (query) params.set("q", query);
     if (type !== "posts") params.set("type", type);
+    if (type === "posts" && context.scope && context.id) {
+      params.set("context", context.scope);
+      params.set("context_id", context.id);
+      params.set("skip_context", "false");
+      if (context.from) params.set("from", context.from);
+    } else {
+      // Explicitly reset native search controllers that retain their last context.
+      params.set("skip_context", "true");
+    }
     const url = `/search${params.size ? `?${params}` : ""}`;
     if (location.pathname + location.search === url) loadSearchPage(1, true);
     else navigateInApp(url);
@@ -4765,6 +4815,8 @@
     main.querySelector(".cx-view-search").addEventListener("click", e => {
       const tab = e.target.closest("[data-search-type]");
       if (tab) navigateSearch(searchQueryFromForm(form), tab.dataset.searchType);
+      if (e.target.closest(".cx-search-return")) navigateInApp(searchRoute().from);
+      if (e.target.closest(".cx-search-global")) navigateSearch(searchQueryFromForm(form), "posts", {});
       if (e.target.closest(".cx-search-more")) loadSearchPage(searchState.page + 1);
       if (e.target.closest(".cx-search-retry")) loadSearchPage(searchState.retryPage, true);
     });
@@ -4787,6 +4839,10 @@
         el.classList.toggle("cx-on", active);
         el.setAttribute("aria-selected", String(active));
       });
+      const scopeBar = document.querySelector(".cx-search-scope");
+      scopeBar.hidden = !searchState.scope;
+      if (searchState.scope) scopeBar.querySelector(".cx-search-scope-label").textContent =
+        searchState.scope === "topic" ? `本帖搜索 · #${searchState.id}` : `本分类搜索 · #${searchState.id}`;
       renderSearchResults();
       syncAppChrome({ title: searchState.query ? `搜索 · ${searchState.query}` : "搜索" });
       if (searchState.query) loadSearchPage(1);
@@ -4816,8 +4872,21 @@
     ];
     const topics = new Map((data.topics || []).map(t => [t.id, t]));
     return (data.posts || []).map(p => {
-      const t = topics.get(p.topic_id) || {};
-      return { id: `post:${p.id}`, title: searchText(t.title || p.topic_title_headline || t.fancy_title), excerpt: searchText(p.blurb), meta: [p.username && `@${p.username}`, p.post_number && `#${p.post_number}`, formatTime(p.created_at)].filter(Boolean).join(" · "), href: `/t/${encodeURIComponent(t.slug || "topic")}/${p.topic_id}${p.post_number > 1 ? `/${p.post_number}` : ""}` };
+      const t = p.topic || topics.get(p.topic_id) || {};
+      const topicId = Number(t.id ?? p.topic_id);
+      const postId = Number(p.id);
+      const postNumber = Number(p.post_number);
+      const title = searchText(t.title || t.fancy_title || p.topic_title_headline);
+      if (!Number.isSafeInteger(topicId) || topicId <= 0 ||
+          !Number.isSafeInteger(postId) || postId <= 0 ||
+          !Number.isSafeInteger(postNumber) || postNumber <= 0 || !title) {
+        throw new Error("搜索响应缺少有效的话题或帖子信息");
+      }
+      return {
+        id: `post:${postId}`, title, excerpt: searchText(p.blurb),
+        meta: [p.username && `@${p.username}`, `#${postNumber}`, formatTime(p.created_at)].filter(Boolean).join(" · "),
+        href: `/t/${encodeURIComponent(t.slug || "topic")}/${topicId}${postNumber > 1 ? `/${postNumber}` : ""}`
+      };
     });
   }
 
@@ -4841,8 +4910,8 @@
     if (!isThemeActive() || !isSearchPath(location.pathname) || !searchState.query || page > 10) return;
     if (searchState.loading && !force) return;
     const owner = pageRequestKey();
-    const { query, type } = searchState;
-    const key = JSON.stringify([query, type, page]);
+    const { query, type, scope, id } = searchState;
+    const key = JSON.stringify([query, type, scope, id, page]);
     const req = searchCoordinator.begin(key);
     const current = () => req.isCurrent() && isThemeActive() && isSearchPath(location.pathname) && pageRequestKey() === owner;
     searchState.loading = true;
@@ -4850,7 +4919,9 @@
     searchState.retryPage = page;
     renderSearchResults();
     try {
-      const endpoint = type === "posts" ? `/search.json?q=${encodeURIComponent(query)}&page=${page}` : `/search/query?term=${encodeURIComponent(query)}${type === "users" ? "&type_filter=user" : ""}`;
+      const context = scope ? `&search_context%5Btype%5D=${scope}&search_context%5Bid%5D=${id}` : "";
+      const postsQuery = /(?:^|\s)in:all-posts(?=\s|$)/i.test(query) ? query : `${query} in:all-posts`;
+      const endpoint = type === "posts" ? `/search.json?q=${encodeURIComponent(postsQuery)}&page=${page}${context}` : `/search/query?term=${encodeURIComponent(query)}${type === "users" ? "&type_filter=user" : ""}`;
       const data = await api(endpoint, undefined, req.signal);
       if (!current()) return;
       const error = data.errors?.join?.(" · ") || data.error || data.grouped_search_result?.error;
@@ -4860,7 +4931,7 @@
       const seen = new Set(previous.map(item => item.id));
       searchState.items = previous.concat(items.filter(item => !seen.has(item.id)));
       searchState.page = page;
-      searchState.more = type === "posts" && page < 10 && !!data.grouped_search_result?.more_full_page_results;
+      searchState.more = type === "posts" && page < 10 && !!data.more_full_page_results;
       searchCoordinator.succeed(req.requestId, key);
     } catch (err) {
       if (!current() || err.name === "AbortError") return;
@@ -4894,6 +4965,8 @@
               <span class="cx-model"></span>
             </div>
             <div class="cx-spacer"></div>
+            <button class="cx-scope-action" data-scope-search="topic" title="在当前帖子搜索" aria-label="在当前帖子搜索">${ICONS.search}<span>本帖搜索</span></button>
+            <button class="cx-scope-action" data-scope-search="category" title="在当前话题分类搜索" aria-label="在当前话题分类搜索">${ICONS.search}<span>本分类搜索</span></button>
             <div class="cx-icon-btn cx-panel-toggle" title="显示 / 隐藏代码面板" data-panel-toggle>${ICONS.panel}</div>
             <div class="cx-icon-btn" title="在原生界面打开" data-open-native>${ICONS.external}</div>
           </header>
@@ -4969,6 +5042,11 @@
       // 顶栏文件夹图标 / 面包屑项目名 → 返回列表
       if (e.target.closest(".cx-back-btn")) {
         backToList();
+        return;
+      }
+      const scopeSearch = e.target.closest("[data-scope-search]");
+      if (scopeSearch) {
+        openScopedSearch(scopeSearch.dataset.scopeSearch);
         return;
       }
       if (e.target.closest("[data-open-native]")) {
@@ -5272,6 +5350,13 @@
     const desc = main.querySelector(".cx-proj-desc");
     const mdEdit = main.querySelector(".codex-composer .cx-md-edit");
     const composeContext = main.querySelector(".cx-composer-context");
+    const topicAction = main.querySelector('[data-scope-search="topic"]');
+    const categoryAction = main.querySelector('[data-scope-search="category"]');
+    topicAction.style.display = isTopicPath(pathname) ? "flex" : "none";
+    const categoryId = isTopicPath(pathname)
+      ? (threadState.topicId === topicIdFromPath(pathname) ? threadState.categoryId : null)
+      : /^\/c\//.test(pathname) ? categoryIdFromPath(pathname) : null;
+    categoryAction.style.display = categoryId ? "flex" : "none";
 
     if (isSearchPath(pathname)) {
       if (proj) proj.textContent = "搜索";

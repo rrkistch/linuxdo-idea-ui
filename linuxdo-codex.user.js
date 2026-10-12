@@ -20,7 +20,7 @@
   const ROOT_CLASS = "codex-theme";   // 本脚本激活标记（互斥检测也看它）
   const LOCK_CLASS = "codex-locked";  // 锁定路由：隐藏原生主内容
 
-  const RAIL_WIDTH = 306; // 左侧 rail，宽度按原版 app 截图比例（~20% 窗宽）校准
+  const RAIL_WIDTH = 336; // 48px 工具栏 + 项目侧栏；已有拖拽宽度优先。
 
   /* ============================== 内联 SVG 图标 ============================== */
 
@@ -132,13 +132,61 @@
   }
 
   async function api(path, extraHeaders, signal) {
+    const controller = new AbortController();
+    let timer, abort;
+    const interrupted = new Promise((resolve, reject) => {
+      abort = () => { controller.abort(); reject(new DOMException("请求已取消", "AbortError")); };
+      timer = setTimeout(() => {
+        controller.abort();
+        const error = new Error("请求超时（20 秒），请重试"); error.name = "TimeoutError"; reject(error);
+      }, 20000);
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, {once:true});
+    });
+    try {
+      if (signal?.aborted) return await interrupted;
+      return await Promise.race([readApiResponse(path, extraHeaders, controller.signal), interrupted]);
+    } finally {
+      clearTimeout(timer); signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  async function readApiResponse(path, extraHeaders, signal) {
     const resp = await fetch(path, {
-      headers: { Accept: "application/json", ...extraHeaders },
+      headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest", ...extraHeaders },
       credentials: "same-origin",
       signal: signal || undefined
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const html = /text\/html/i.test(resp.headers.get("content-type") || "");
+    if (!resp.ok || html || resp.headers.get("cf-mitigated") === "challenge") {
+      const body = await resp.text();
+      let data;
+      try { data = JSON.parse(body); } catch { /* Never render a server HTML error page. */ }
+      const challenged = resp.headers.get("cf-mitigated") === "challenge" || (html &&
+        /<title[^>]*>\s*(?:Just a moment|Attention Required)|id=["'](?:challenge-form|cf-challenge-running)|\/cdn-cgi\/challenge-platform\//i.test(body));
+      // Some endpoints have inaccurate content types; valid JSON still works.
+      if (resp.ok && !challenged && data !== undefined) return data;
+      const error = new Error(`HTTP ${resp.status}`);
+      error.status = resp.status;
+      error.kind = challenged ? "challenge" : resp.status === 401 || resp.headers.get("Discourse-Logged-Out") ||
+          ["not_logged_in", "login_required"].includes(data?.error_type) ? "login" :
+          data?.error_type === "invalid_access" ? "permission" : "unknown";
+      error.detail = Array.isArray(data?.errors) ? data.errors.filter(e => typeof e === "string").join("；").slice(0, 300) : "";
+      throw error;
+    }
     return resp.json();
+  }
+
+  function apiFailureText(error) {
+    const status = error.status || /HTTP (\d+)/.exec(error.message || "")?.[1];
+    const code = status ? `HTTP ${status}` : "网络请求失败";
+    let message = error.kind === "challenge" ? "站点要求浏览器验证，请打开原版完成验证后重试" :
+      error.kind === "login" ? "请打开原版确认登录状态后重试" :
+      error.kind === "permission" ? "服务器拒绝访问此内容" :
+      Number(status) === 403 ? "服务器拒绝了本次请求，请稍后重试" :
+      error.message && !/^HTTP \d+$/.test(error.message) ? error.message : "请求失败";
+    if (error.detail) message += `；${error.detail}`;
+    return `${code}：${message}`;
   }
 
   /** 话题浏览上报头（对齐 Discourse 前端 trackNextAjaxAsTopicView，views +1 且服务端按天/IP 去重） */
@@ -376,11 +424,20 @@
     // Discourse replaces the floor suffix while tracking reading progress. That
     // changes the address, not the owner of the visible topic or its requests.
     if (isTopicPath(location.pathname)) return `topic:${topicIdFromPath(location.pathname)}`;
+    if (isHomePath(location.pathname)) return `list:${location.pathname}${location.search}`;
     return isSearchPath(location.pathname) ? `${location.pathname}${location.search}` : location.pathname;
   }
 
   function invalidatePageRequests(force = false) {
     if (!force && requestPage === pageRequestKey()) return;
+    saveComposerDraft();
+    rememberTopicPosition();
+    rememberListSnapshot();
+    if (isTopicPath(location.pathname)) {
+      const source = history.state?.codexListOrigin;
+      if (typeof source === "string") topicListOrigin = source;
+      else if (!requestPage.startsWith("topic:")) topicListOrigin = requestPage.startsWith("list:") ? listState.path : "";
+    }
     requestPage = pageRequestKey();
     if (cxPopEl?.classList.contains("cx-user-card")) cxClosePop();
     listCoordinator.cancel();
@@ -392,6 +449,7 @@
     searchState.routeKey = null;
     searchState.loading = false;
     listState.loading = threadState.loading = false;
+    syncComposerContext();
   }
 
   /** 统一外壳同步：集中管理标题、favicon、面包屑与活动状态 */
@@ -423,6 +481,7 @@
    */
   function teardownTheme() {
     if (!isThemeActiveState) return;
+    saveComposerDraft();
     isThemeActiveState = false;
     listCoordinator.cancel();
     listMoreCoordinator.cancel();
@@ -435,6 +494,12 @@
     listState.loading = threadState.loading = false;
     listState.topics = [];
     listState.moreUrl = null;
+    listState.ready = false;
+    listSnapshots.clear();
+    topicListOrigin = "";
+    listRestoreKey = "";
+    threadState.acceptedAnswers = [];
+    threadState.solved = false;
     threadState.topicId = null;
     threadState.title = "";
     stopReadTracking();
@@ -536,6 +601,95 @@
 
   let cxComposerSubmitting = false;
   let composerUploading = false;
+  const composerDrafts = new Map();
+  const composerSends = new Set();
+  const composerUploads = new Set();
+  const COMPOSER_DRAFT_PREFIX = "linuxdo-codex-draft:";
+
+  function composerContext() {
+    const actor = extractUsernameFromHref(document.querySelector('#current-user a[href*="/u/"]')?.getAttribute("href")) || getCurrentUsername() || "guest";
+    const topicId = isTopicPath(location.pathname) ? topicIdFromPath(location.pathname) : null;
+    if (!topicId && !isHomePath(location.pathname)) return null;
+    const categoryId = topicId ? null : categoryIdFromPath(location.pathname);
+    return { actor, topicId, categoryId, key: `${actor}:${topicId ? `topic:${topicId}` : `new:${categoryId || "all"}`}` };
+  }
+  function composerDraft(key) {
+    if (!composerDrafts.has(key)) {
+      let saved;
+      try { saved = JSON.parse(sessionStorage.getItem(COMPOSER_DRAFT_PREFIX + key)); } catch { /* unavailable storage */ }
+      composerDrafts.set(key, { raw: typeof saved?.raw === "string" ? saved.raw : "",
+        replyTo: Number(saved?.replyTo) || null, revision: Number(saved?.revision) || 0 });
+    }
+    return composerDrafts.get(key);
+  }
+  function persistComposerDraft(key) {
+    const draft = composerDraft(key);
+    try { sessionStorage.setItem(COMPOSER_DRAFT_PREFIX + key, JSON.stringify({raw:draft.raw, replyTo:draft.replyTo, revision:draft.revision})); } catch { /* memory remains usable */ }
+  }
+  function saveComposerDraft() {
+    const input = cxComposerUi().input;
+    const key = input?.dataset.draftKey;
+    if (!key) return;
+    const draft = composerDraft(key), raw = cxMdGetSource(input);
+    if (draft.raw !== raw || draft.replyTo !== cxComposerTargetPost) {
+      draft.raw = raw; draft.replyTo = cxComposerTargetPost; draft.revision++;
+      persistComposerDraft(key);
+    }
+  }
+  function setComposerSource(input, raw) {
+    input.replaceChildren();
+    const block = document.createElement("div");
+    block.className = "cx-md-block"; block.textContent = raw; block.dataset.src = raw;
+    input.appendChild(block); input.classList.toggle("has-content", !!raw);
+    cxSyncPreview(input);
+  }
+  function ownsComposer(owner) {
+    return isThemeActive() && composerContext()?.key === owner.key && cxComposerUi().input?.dataset.draftKey === owner.key;
+  }
+  function paintComposerTarget() {
+    const {target} = cxComposerUi();
+    if (!target) return;
+    const post = threadState.postsByNum[String(cxComposerTargetPost)];
+    const name = post?.name || post?.username;
+    target.classList.toggle("active", !!cxComposerTargetPost);
+    target.querySelector("span").textContent = cxComposerTargetPost ? `回复${name ? ` ${name}` : ""} · #${cxComposerTargetPost}` : "";
+  }
+  function syncComposerContext() {
+    const {input} = cxComposerUi();
+    if (!input) return;
+    const owner = composerContext();
+    if (input.dataset.draftKey !== (owner?.key || "")) {
+      saveComposerDraft();
+      input.dataset.draftKey = owner?.key || "";
+      const draft = owner ? composerDraft(owner.key) : {raw:"", replyTo:null};
+      cxComposerTargetPost = draft.replyTo;
+      setComposerSource(input, draft.raw);
+      setComposerStatus(draft.message || "", draft.failed ? "err" : "");
+      document.querySelector(".cx-native-draft")?.remove();
+      if (draft.failed && owner) offerNativeDraft(owner);
+    }
+    paintComposerTarget();
+    cxUpdateSendState();
+  }
+  function composerResult(owner, text, kind) {
+    const draft = composerDraft(owner.key);
+    draft.message = text; draft.failed = kind === "err";
+    if (ownsComposer(owner)) setComposerStatus(text, kind);
+  }
+  function offerNativeDraft(owner) {
+    if (!ownsComposer(owner)) return;
+    const card = cxComposerUi().card;
+    card.querySelector(".cx-native-draft")?.remove();
+    const button = document.createElement("button");
+    button.type = "button"; button.className = "cx-native-draft"; button.textContent = "打开原生编辑器";
+    button.onclick = async () => {
+      saveComposerDraft(); button.disabled = true;
+      try { await transferComposerDraft(owner, composerDraft(owner.key).raw); }
+      catch (error) { composerResult(owner, error.message, "err"); }
+      finally { button.disabled = false; }
+    };
+    card.querySelector(".cx-composer-status").after(button);
+  }
 
   function cxTransferImages(event) {
     const list = [...(event.clipboardData?.files || event.dataTransfer?.files || [])];
@@ -603,7 +757,7 @@
 
   /* ============================== 嵌入 im 式 markdown 输入框（移植自 im ui/composer.js + markdown-lite.js） ==============================
      结构自上而下：目标条 → 预览条 → contenteditable 输入（Typora 式块）→ 工具栏（按用户要求置于下方）→ 隐藏 file。
-     发送走后端 API（/posts.json），失败再落原生编辑器；图片粘贴/拖拽/选择统一上传后以 markdown 插入本皮输入框。 */
+     发送走后端 API（/posts.json），失败保留草稿并由用户选择原生编辑器；图片粘贴/拖拽/选择统一上传后以 markdown 插入本皮输入框。 */
 
   const CX_PREVIEW_KEY = "linuxdo-codex-compose-preview";
 
@@ -817,6 +971,7 @@
     input.classList.toggle("has-content", !cxMdIsEmpty(input));
     cxSyncPreview(input);
     cxUpdateSendState();
+    saveComposerDraft();
   }
   function cxMdRenderBlock(block) {
     const src = (block.dataset.src ?? "").trim();
@@ -1026,7 +1181,11 @@
   let cxPopEl = null;
   let cxPopOutsideClose = null;
   let cxPopCleanup = null;
+  let authorHoverTimer = null;
+  let restoringAuthorFocus = false;
+  const authorCache = new Map();
   function cxClosePop() {
+    clearTimeout(authorHoverTimer);
     if (!cxPopEl) return;
     const cleanup = cxPopCleanup;
     cxPopCleanup = null;
@@ -1064,6 +1223,7 @@
   }
 
   async function openAuthorCard(anchor) {
+    clearTimeout(authorHoverTimer);
     const username = anchor.dataset.cxUser;
     if (!isThemeActive() || !username || cxPopEl?.dataset.username === username) return;
     cxOpenPop(anchor, "cx-user-card", `<strong class="cx-user-name"></strong><span class="cx-user-handle"></span><div class="cx-user-info" role="status">正在加载资料…</div><a href="/u/${encodeURIComponent(username)}">查看个人主页</a>`);
@@ -1086,19 +1246,33 @@
     const closeOnEscape = e => {
       if (e.key !== "Escape") return;
       e.preventDefault();
-      anchor.focus({ preventScroll: true });
+      restoringAuthorFocus = true;
+      try { anchor.focus({ preventScroll: true }); } finally { restoringAuthorFocus = false; }
       cxClosePop();
     };
     document.addEventListener("keydown", closeOnEscape);
+    const closeOnMove = e => {
+      if (!(e.target instanceof Node) || !card.contains(e.target)) cxClosePop();
+    };
+    window.addEventListener("scroll", closeOnMove, true);
+    window.addEventListener("resize", closeOnMove);
     cxPopCleanup = () => {
       controller.abort();
       document.removeEventListener("keydown", closeOnEscape);
+      window.removeEventListener("scroll", closeOnMove, true);
+      window.removeEventListener("resize", closeOnMove);
     };
     try {
-      const data = await api(`/u/${encodeURIComponent(username)}.json`, undefined, controller.signal);
+      const cacheKey = `${composerContext()?.actor || getCurrentUsername() || "guest"}:${username.toLowerCase()}`;
+      const cached = authorCache.get(cacheKey);
+      const data = cached && Date.now() - cached.at < 30000 ? cached.data : await api(`/u/${encodeURIComponent(username)}.json`, undefined, controller.signal);
       if (cxPopEl !== card || !isThemeActive()) return;
       const user = data.user;
       if (!user || String(user.username).toLowerCase() !== username.toLowerCase()) throw new Error("用户不存在");
+      if (data !== cached?.data) {
+        authorCache.delete(cacheKey); authorCache.set(cacheKey, {data, at:Date.now()});
+        if (authorCache.size > 50) authorCache.delete(authorCache.keys().next().value);
+      }
       card.querySelector(".cx-user-name").textContent = user.name || user.username;
       card.querySelector(".cx-user-info").textContent = [user.title, user.location, user.bio_raw].filter(Boolean).join(" · ") || "暂无个人简介";
       const dates = document.createElement("div");
@@ -1171,13 +1345,14 @@
     cxInsertComposeText(input, text);
   }
   function cxEditorInsertQuoteOfTarget(input) {
+    const owner = composerContext();
+    if (!owner?.topicId || threadState.topicId !== owner.topicId) return;
     const targetPost = cxComposerTargetPost || Math.max(0, ...Object.keys(threadState.postsByNum || {}).map(Number));
     const post = threadState.postsByNum && threadState.postsByNum[targetPost];
     if (post?.id) {
-      fetch(`/posts/${post.id}.json`, { credentials: "same-origin", headers: { "X-Requested-With": "XMLHttpRequest" } })
-        .then((r) => (r.ok ? r.json() : Promise.reject()))
-        .then((data) => cxInsertBlock(input, `[quote="${data.username}, post:${data.post_number}"]\n${data.raw}\n[/quote]`))
-        .catch(() => setComposerStatus("引用加载失败", "err"));
+      api(`/posts/${post.id}.json`, undefined, topicCoordinator.controller?.signal)
+        .then(data => { if (ownsComposer(owner)) cxInsertBlock(input, `[quote="${data.username}, post:${data.post_number}"]\n${data.raw}\n[/quote]`); })
+        .catch(error => { if (ownsComposer(owner) && error.name !== "AbortError") setComposerStatus("引用加载失败", "err"); });
     } else {
       setComposerStatus("未找到可引用的楼层", "err");
     }
@@ -1244,6 +1419,7 @@
     if (!target) return;
     if (!cxComposerTargetPost) {
       target.classList.remove("active");
+      saveComposerDraft();
       return;
     }
     const post = threadState.postsByNum[String(cxComposerTargetPost)];
@@ -1251,11 +1427,13 @@
     target.querySelector("span").textContent = name ? `回复 ${name} · #${cxComposerTargetPost}` : `回复 #${cxComposerTargetPost}`;
     target.classList.add("active");
     input?.focus();
+    saveComposerDraft();
   }
   function cxHideComposerTarget() {
     cxComposerTargetPost = null;
     const { target } = cxComposerUi();
     if (target) target.classList.remove("active");
+    saveComposerDraft();
   }
 
   /* ---- 图片上传：选择 / 粘贴 / 拖拽 → markdown 插入输入框 ---- */
@@ -1266,38 +1444,31 @@
     return /\.(?:avif|bmp|gif|jpe?g|png|svg|webp)$/i.test(String(file.name || ""));
   }
   async function cxUploadComposerImages(files, input) {
+    syncComposerContext(); saveComposerDraft();
+    const owner = composerContext();
     const selected = [...(files || [])].filter(cxImageFile);
-    if (!selected.length) {
-      setComposerStatus("请选择图片文件", "err");
-      return;
-    }
-    if (composerUploading) {
-      setComposerStatus("已有图片正在上传，请稍候", "err");
-      return;
-    }
-    composerUploading = true;
-    cxUpdateSendState();
+    if (!owner || !selected.length || composerUploads.has(owner.key) || composerSends.has(owner.key)) return;
+    composerUploads.add(owner.key); cxUpdateSendState();
     try {
       const marks = [];
       for (const file of selected) {
-        setComposerStatus(`正在上传 ${file.name || "图片"}…`, "busy");
+        composerResult(owner, `正在上传 ${file.name || "图片"}…`, "busy");
         const upload = await cxUploadImage(file);
         cxRegisterUploadUrl(upload.short_url, upload.url || upload.thumbnail_url);
         marks.push(cxImageMarkdown(upload, file));
       }
-      const inputEl = input || cxComposerUi().input;
-      if (inputEl) {
-        cxInsertComposeText(inputEl, marks.join("\n"));
-        setComposerStatus(`已添加 ${marks.length} 张图片`, "ok");
+      if (ownsComposer(owner)) {
+        cxInsertComposeText(cxComposerUi().input, marks.join("\n"));
       } else {
-        copyText(marks.join("\n"));
-        setComposerStatus(`已上传，md 已复制到剪贴板`, "ok");
+        const draft = composerDraft(owner.key);
+        draft.raw = [draft.raw, marks.join("\n")].filter(Boolean).join("\n\n");
+        draft.revision++; persistComposerDraft(owner.key);
       }
-    } catch (e) {
-      setComposerStatus(`上传失败: ${(e && e.message) || "未知错误"}`, "err");
+      composerResult(owner, `已添加 ${marks.length} 张图片`, "ok");
+    } catch (error) {
+      composerResult(owner, `上传失败：${error.message || "未知错误"}`, "err");
     } finally {
-      composerUploading = false;
-      cxUpdateSendState();
+      composerUploads.delete(owner.key); cxUpdateSendState();
     }
   }
   function cxComposerTransferImages(event) {
@@ -1309,7 +1480,12 @@
   function cxUpdateSendState() {
     const { input, send } = cxComposerUi();
     if (!input || !send) return;
-    send.disabled = cxComposerSubmitting || composerUploading || cxMdIsEmpty(input);
+    const owner = composerContext();
+    cxComposerSubmitting = !!owner && composerSends.has(owner.key);
+    composerUploading = !!owner && composerUploads.has(owner.key);
+    const ready = owner && (!owner.topicId || (topicCoordinator.loadedKey === `topic:${owner.topicId}` && topicCoordinator.status === "ready"));
+    send.disabled = !ready || cxComposerSubmitting || composerUploading || cxMdIsEmpty(input);
+    send.setAttribute("aria-busy", String(cxComposerSubmitting || composerUploading));
   }
   async function cxApiReply(raw, topicId, replyTo) {
     const body = { raw, topic_id: Number(topicId) };
@@ -1332,76 +1508,68 @@
     if (!post || (!post.id && !post.post_id)) throw new Error("站点未确认回复");
     return post;
   }
-  async function cxNativeReply(raw, replyTo) {
-    openNativeComposer(replyTo);
-    let ta = null;
-    for (let i = 0; i < 60 && !ta; i++) {
-      await new Promise((r) => setTimeout(r, 100));
-      ta = document.querySelector("#reply-control.open textarea, #reply-control.fullscreen textarea, #reply-control textarea");
-    }
-    if (!ta) throw new Error("无法打开原生编辑器");
-    ta.focus();
-    ta.value = raw;
-    ta.dispatchEvent(new Event("input", { bubbles: true }));
-    const btn = document.querySelector(
-      "#reply-control .save-or-cancel button.create, .save-or-cancel button.btn-primary, #reply-control button.create.btn-primary"
-    );
-    if (!btn) throw new Error("找不到原生提交按钮");
-    btn.click();
-  }
-  function cxCompleteComposerSend(input) {
-    cxMdClear(input);
-    cxHideComposerTarget();
-  }
-  async function cxSubmitComposer() {
-    const { input } = cxComposerUi();
-    const raw = input ? cxMdGetSource(input) : "";
-    if (!input || !raw.trim() || cxComposerSubmitting || composerUploading) return;
-    const topicId = Number(threadState.topicId || 0);
-    // 列表视图：内容原样转入原生「发新帖」编辑器（标题由用户补）
-    if (!topicId) {
-      if (!getCurrentUsername()) {
-        setComposerStatus("登录后才能发帖", "err");
+  async function transferComposerDraft(owner, raw) {
+    if (!ownsComposer(owner)) return;
+    const draft = composerDraft(owner.key);
+    if (owner.topicId) {
+      if (threadState.topicId !== owner.topicId || topicCoordinator.status !== "ready") throw new Error("话题尚未加载完成");
+      const nativeTopic = getTopicModel(getEmberOwner());
+      const nativeId = Number(nativeTopic?.get?.("id") || nativeTopic?.id);
+      if (nativeId && nativeId !== owner.topicId) throw new Error("原生话题尚未同步，请稍候再试");
+      openNativeComposer(draft.replyTo);
+    } else openNewTopicComposer();
+    composerResult(owner, "正在打开原生编辑器…", "busy");
+    for (let i = 0; i < 60; i++) {
+      if (!ownsComposer(owner)) return;
+      const ta = document.querySelector("#reply-control.open textarea, #reply-control.fullscreen textarea");
+      if (ta) {
+        if (ta.value.trim() && ta.value !== raw) throw new Error("原生编辑器已有草稿，请先核对内容");
+        if (!ta.value) insertMdIntoNative(raw);
+        composerResult(owner, "正文已转入原生编辑器，请在那里确认发送", "ok");
         return;
       }
-      setComposerStatus("正在打开发帖编辑器…", "busy");
-      openNewTopicComposer();
-      let inserted = false;
-      for (let i = 0; i < 60 && !inserted; i++) {
-        await new Promise((r) => setTimeout(r, 100));
-        inserted = insertMdIntoNative(raw);
-      }
-      if (inserted) {
-        cxCompleteComposerSend(input);
-        setComposerStatus("正文已转入原生发帖编辑器 ✓", "ok");
-      } else {
-        setComposerStatus("打开发帖编辑器失败", "err");
-      }
-      return;
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
-    cxComposerSubmitting = true;
-    cxUpdateSendState();
-    setComposerStatus("正在发送…", "busy");
-    const replyTo = cxComposerTargetPost || undefined;
+    throw new Error("无法打开原生编辑器，草稿已保留");
+  }
+  async function cxSubmitComposer() {
+    syncComposerContext(); saveComposerDraft();
+    const owner = composerContext();
+    if (!owner) return;
+    const draft = composerDraft(owner.key);
+    if (!draft.raw.trim() || composerSends.has(owner.key) || composerUploads.has(owner.key)) return;
+    if (owner.topicId && (threadState.topicId !== owner.topicId || topicCoordinator.status !== "ready")) return;
+    const {raw, replyTo, revision} = draft;
+    composerSends.add(owner.key); cxUpdateSendState();
     try {
-      try {
-        await cxApiReply(raw, topicId, replyTo);
-        cxCompleteComposerSend(input);
-        setComposerStatus("已发送 ✓", "ok");
-        refreshAfterReply();
-      } catch (apiError) {
-        setComposerStatus(`接口发送失败，转入原生编辑器：${apiError.message || ""}`, "err");
-        try {
-          await cxNativeReply(raw, replyTo);
-          cxCompleteComposerSend(input);
-          setComposerStatus("已通过原生编辑器发送 ✓", "ok");
-        } catch (nativeError) {
-          setComposerStatus(`发送失败：${nativeError.message || apiError.message || "未知错误"}`, "err");
+      if (!owner.topicId) {
+        if (owner.actor === "guest") throw new Error("登录后才能发帖");
+        await transferComposerDraft(owner, raw);
+        return;
+      }
+      composerResult(owner, "正在发送…", "busy");
+      await cxApiReply(raw, owner.topicId, replyTo);
+      // The server confirmed this submission. Do not erase text edited meanwhile
+      // or a different route's draft, even though the DOM editor is shared.
+      const current = composerDraft(owner.key);
+      if (current.revision === revision && current.raw === raw) {
+        current.raw = ""; current.replyTo = null; current.revision++;
+        persistComposerDraft(owner.key);
+        if (ownsComposer(owner)) {
+          cxComposerTargetPost = null;
+          setComposerSource(cxComposerUi().input, ""); paintComposerTarget();
         }
       }
+      composerResult(owner, "已发送 ✓", "ok");
+      if (ownsComposer(owner)) {
+        document.querySelector(".cx-native-draft")?.remove();
+        refreshAfterReply();
+      }
+    } catch (error) {
+      composerResult(owner, `发送失败或结果未确认：${error.message || "网络错误"}。草稿已保留，请先核对是否已发出。`, "err");
+      offerNativeDraft(owner);
     } finally {
-      cxComposerSubmitting = false;
-      cxUpdateSendState();
+      composerSends.delete(owner.key); cxUpdateSendState();
     }
   }
   /** 发送后的刷新只合并楼层和更新分页信息，不替换已读窗口或追到页尾。 */
@@ -1413,6 +1581,7 @@
     try {
       const data = await api(`/t/${topicId}.json`, undefined, req.signal);
       if (!req.isCurrent() || !topicCoordinator.isCurrent(ownerVersion) || threadState.topicId !== topicId || !isThemeActive()) return;
+      updateTopicSolutions(data, true);
       const posts = (data.post_stream && data.post_stream.posts) || [];
       const firstId = threadState.stream[threadState.renderedFirstIdx];
       const lastId = threadState.stream[threadState.renderedLastIdx];
@@ -1734,21 +1903,25 @@
   }
 
   /** 列表 JSON 端点按路由映射 */
-  function listApiForPath(pathname) {
-    if (pathname === "/" || pathname === "/latest") return "/latest.json";
-    if (pathname === "/new") return "/new.json";
-    if (pathname === "/unread" || pathname === "/unseen") return "/unseen.json";
-    if (pathname === "/top") return "/top.json";
-    if (pathname === "/hot") return "/hot.json";
-    if (pathname === "/posted") return "/posted.json";
-    if (pathname === "/read") return "/read.json";
-    if (pathname === "/bookmarks") return "/bookmarks.json";
-    if (pathname === "/categories") return "/latest.json";
-    const c = pathname.match(/^\/c\/([\w-]+(?:\/[\w-]+)?)/);
-    if (c) return `/c/${c[1]}.json`;
-    const t = pathname.match(/^\/tag\/([\w-]+)/);
-    if (t) return `/tag/${t[1]}.json`;
-    return "/latest.json";
+  function listApiForPath(path) {
+    const url = new URL(path, location.origin);
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
+    const params = new URLSearchParams();
+    // Keep native list semantics, without passing skin/native-mode flags to the API.
+    const allowed = new Set(["order", "ascending", "subset", "period", "page", "per_page",
+      "before", "bumped_before", "topic_ids", "category", "min_posts", "max_posts",
+      "status", "filter", "state", "search", "q", "f", "group_name", "tags", "tags[]",
+      "match_all_tags", "no_subcategories", "no_tags", "exclude_tag"]);
+    for (const [key, value] of url.searchParams) if (allowed.has(key)) params.append(key, value);
+    let endpoint = "/latest";
+    if (/^\/(latest|new|unread|unseen|top|hot|posted|read|bookmarks)$/.test(pathname)) endpoint = pathname;
+    else if (/^\/(c|tag)\//.test(pathname)) endpoint = pathname;
+    const period = /^\/top\/(daily|weekly|monthly|quarterly|yearly|all)$/.exec(pathname);
+    if (period) { endpoint = "/top"; params.set("period", period[1]); }
+    const numericTag = /^\/tag\/(\d+)-tag$/.exec(endpoint);
+    if (numericTag) endpoint += `/${numericTag[1]}`;
+    const query = params.toString();
+    return `${endpoint}.json${query ? `?${query}` : ""}`;
   }
 
   /** 列表视图大标题 */
@@ -1756,15 +1929,15 @@
     if (pathname === "/" || pathname === "/latest") return "最新";
     if (pathname === "/new") return "新话题";
     if (pathname === "/unread" || pathname === "/unseen") return "未读";
-    if (pathname === "/top") return "排行榜";
+    if (/^\/top(?:\/|$)/.test(pathname)) return "排行榜";
     if (pathname === "/hot") return "热门";
     if (pathname === "/posted") return "我的帖子";
     if (pathname === "/read") return "已读";
     if (pathname === "/bookmarks") return "稍后看";
     const c = pathname.match(/^\/c\/([\w-]+)/);
     if (c) {
-      const idM = pathname.match(/\/(\d+)$/);
-      const cat = idM ? categoryById(Number(idM[1])) : categoryBySlug(c[1]);
+      const catId = categoryIdFromPath(pathname);
+      const cat = catId ? categoryById(catId) : categoryBySlug(c[1]);
       if (cat) return cat.name;
       return c[1];
     }
@@ -3163,7 +3336,7 @@
     }
     .codex-thread-col .codex-thread { min-width: 0; }
     .cx-code-panel {
-      width: var(--cx-panel-w, 50%);   /* 默认与中间栏 1:1，可拖拽改写 */
+      width: var(--cx-panel-w, 36%);   /* 给阅读区留足宽度；已有拖拽宽度优先。 */
       min-width: 280px;
       flex: none;
       border-left: 1px solid var(--cx-border-soft);
@@ -3453,6 +3626,58 @@
       .cx-resizer { display: none !important; }
       .${ROOT_CLASS}.codex-hide-code-panel .codex-thread-col { flex: 1; width: auto; }
       .codex-topbar .cx-panel-toggle { display: none; }
+    }
+
+    .cx-solutions { margin:16px 0 24px; border:1px solid var(--cx-border-strong); border-radius:10px; overflow:hidden; min-width:0; }
+    .cx-solutions-title { display:flex; align-items:center; gap:8px; padding:10px 14px; margin:0; color:var(--cx-diff-add-ln); background:var(--cx-diff-add-bg); font-size:13px; line-height:1.5; }
+    .cx-solutions-title svg { width:15px; height:15px; flex:none; }
+    .cx-solutions .cx-solution-item { margin:0; border:0; border-top:1px solid var(--cx-border-soft); border-radius:0; padding:0; }
+    .cx-solutions .cx-solution-item > summary { width:100%; padding:8px 14px; min-height:38px; box-sizing:border-box; }
+    .cx-solution-item > summary > :first-child { min-width:0; overflow-wrap:anywhere; }
+    .cx-solution-meta { color:var(--cx-text-dim); font-size:11px; margin-left:auto; white-space:nowrap; }
+    .cx-solution-body { padding:0 14px 14px; font-size:13px; line-height:1.7; }
+    .cx-solution-excerpt { margin:8px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .cx-solution-body a { color:var(--cx-blue); }
+    .cx-solution-badge { font-size:11px; color:var(--cx-diff-add-ln); background:var(--cx-diff-add-bg); border-radius:4px; padding:1px 6px; }
+
+    .cx-boost-slot:empty { display:none; }
+    .cx-boost-bar { display:flex; flex-wrap:wrap; align-items:flex-start; gap:6px; margin:8px 0 12px; font-size:12px; line-height:1.6; }
+    .cx-boost-chip { display:inline-flex; align-items:baseline; flex-wrap:wrap; gap:5px; max-width:100%; min-width:0; padding:4px 9px; border:1px solid var(--cx-border-soft); border-radius:10px; background:var(--cx-bg-raised); color:var(--cx-text-secondary); overflow-wrap:anywhere; }
+    .cx-boost-chip > .cx-author-link { color:var(--cx-text-dim); }
+    .cx-boost-chip details { min-width:0; max-width:100%; }
+    .cx-boost-chip summary { cursor:pointer; overflow-wrap:anywhere; }
+    .cx-boost-full { margin:6px 0 2px; white-space:pre-wrap; }
+    /* Desktop shell: functional app strip, quiet surfaces and aligned reading/composer columns. */
+    .codex-rail { padding-left:48px; box-sizing:border-box; border-right:1px solid var(--cx-border-soft); }
+    .codex-app-strip { position:absolute; inset:0 auto 0 0; width:48px; display:flex; flex-direction:column; align-items:center; gap:10px; padding:14px 0; box-sizing:border-box; background:var(--cx-bg-inset); border-right:1px solid var(--cx-border-soft); }
+    .codex-app-strip button { width:34px; height:34px; padding:8px; border:0; border-radius:10px; color:var(--cx-text-dim); background:transparent; cursor:pointer; display:grid; place-items:center; }
+    .codex-app-strip button:hover, .codex-app-strip button[aria-current="page"] { color:var(--cx-text); background:var(--cx-btn-hover); }
+    .codex-app-strip button:focus-visible { outline:2px solid var(--cx-blue); outline-offset:2px; }
+    .codex-app-strip svg { width:18px; height:18px; }
+    .codex-app-strip [data-strip-action="sidebar"] { margin-top:auto; }
+    .codex-rail-traffic { height:32px; }
+    .codex-rail-section { font-size:12px; }
+    .codex-rail-item { border-radius:9px; }
+    .codex-topbar { height:50px; }
+    .codex-thread-inner { width:100%; max-width:760px; }
+    .cx-cooked { font-size:14px; line-height:1.8; }
+    .cx-worked, .cx-turn-meta { color:var(--cx-text-dim); opacity:1; }
+    .cx-worked:hover, .cx-turn-meta:hover { opacity:1; }
+    .cx-worked .cx-author-link, .cx-turn-meta .cx-author-link { color:var(--cx-text-secondary); }
+    .cx-crumb .cx-proj { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .cx-turn-activity { margin:8px 0 14px; }
+    .cx-turn-activity .cx-think-body { margin:10px 0; color:var(--cx-text-dim); font-size:12px; }
+    .cx-turn-activity .cx-tools { margin:8px 0 0 8px; }
+    .codex-composer { max-width:760px; border-radius:22px; padding:14px 16px 10px; box-shadow:none; }
+    .codex-composer .cx-md-edit { min-height:48px; }
+    .cx-native-draft { border:0; padding:3px 7px; border-radius:6px; background:var(--cx-btn-hover); color:var(--cx-text); font:inherit; font-size:11px; cursor:pointer; }
+    .cx-code-panel { border-left:1px solid var(--cx-border-soft); }
+    .cx-code-tabs { padding-top:8px; background:var(--cx-bg); }
+    .cx-code-tab { border-radius:8px 8px 0 0; }
+    @media (min-width:1025px) {
+      html.codex-rail-collapsed .codex-rail { padding-left:0; }
+      html.codex-rail-collapsed .codex-rail > :not(.codex-app-strip) { display:none !important; }
+      html.codex-rail-collapsed .codex-app-strip { width:52px; }
     }
 
     /* ================= 全局浮动元素：toast / 引用跳回按钮 ================= */
@@ -4369,8 +4594,9 @@
     return false;
   }
 
-  function navigateInApp(url) {
+  function navigateInApp(url, restoreList = false) {
     if (!url) return;
+    restoreTopicEntry = false;
     // 绝对地址收成站内路径
     let path = url;
     try {
@@ -4383,6 +4609,7 @@
     // A clicked floor link is explicit navigation, even if Discourse would use
     // replaceState for it. Keep it distinct from native read-position updates.
     const target = new URL(path, location.href);
+    listRestoreKey = restoreList && isHomePath(target.pathname) ? `list:${target.pathname}${target.search}` : "";
     if (isTopicPath(target.pathname) && isTopicPath(location.pathname) &&
         topicIdFromPath(target.pathname) === topicIdFromPath(location.pathname)) {
       history.pushState({}, "", path);
@@ -4480,7 +4707,11 @@
   }
 
   function topicUnread(topic) {
-    return (topic.unread > 0 ? topic.unread : 0) + (topic.new_posts > 0 ? topic.new_posts : 0);
+    // These are alternate serializer fields, not disjoint unread counters.
+    for (const key of ["unread_posts", "new_posts", "unread"]) {
+      if (typeof topic[key] === "number" && Number.isFinite(topic[key])) return Math.max(0, topic[key]);
+    }
+    return 0;
   }
 
   function ensureRail() {
@@ -4492,6 +4723,20 @@
     rail = document.createElement("aside");
     rail.className = "codex-rail";
     rail.setAttribute("aria-label", "Codex 风导航");
+    const strip = document.createElement("nav");
+    strip.className = "codex-app-strip"; strip.setAttribute("aria-label", "快捷导航");
+    strip.innerHTML = [["topics", "话题", "folder"], ["search", "搜索", "search"],
+      ["bookmarks", "稍后看", "bookmark"], ["activity", "近期活动", "clock"], ["sidebar", "折叠或展开侧栏", "sidebar"]]
+      .map(([action,label,icon]) => `<button type="button" data-strip-action="${action}" aria-label="${label}" title="${label}">${ICONS[icon]}</button>`).join("");
+    strip.addEventListener("click", e => {
+      const action = e.target.closest("[data-strip-action]")?.dataset.stripAction;
+      if (!action) return;
+      e.stopPropagation();
+      if (action === "sidebar") rail.querySelector(".cx-sidebar-toggle")?.click();
+      else if (action === "search") { closeRailDrawer(); openNativeSearch(); }
+      else { closeRailDrawer(); navigateInApp({topics:"/latest", bookmarks:"/bookmarks", activity:"/my/activity"}[action]); }
+    });
+    rail.appendChild(strip);
 
     // 顶部窗口控制按钮（宽屏侧栏折叠 / 站内后退 / 前进）
     const traffic = document.createElement("div");
@@ -4747,8 +4992,11 @@
       // 分类名到位后刷新列表视图标题/面包屑
       syncChrome();
     });
-    if (!recentTopicsCache) {
-      api("/latest.json")
+    // On the unfiltered latest page the main list supplies the same data. Do not
+    // double its startup request (on top of the native site's own navigation).
+    const mainLoadsLatest = isHomePath(location.pathname) && listApiForPath(location.pathname + location.search) === "/latest.json";
+    if (!recentTopicsCache && !mainLoadsLatest) {
+      api("/latest.json", {"Discourse-Background":"true"})
         .then((data) => {
           recentTopicsCache = (data.topic_list && data.topic_list.topics) || [];
           renderRailDynamic();
@@ -4761,6 +5009,10 @@
   function syncRail() {
     const rail = document.querySelector(".codex-rail");
     if (!rail) return;
+    for (const button of rail.querySelectorAll("[data-strip-action]")) {
+      const on = button.dataset.stripAction === (isSearchPath(location.pathname) ? "search" : location.pathname === "/bookmarks" ? "bookmarks" : location.pathname.startsWith("/my") ? "activity" : "topics");
+      if (on) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
+    }
     bindRailClicks();
 
     const name = getCurrentUsername();
@@ -5103,6 +5355,11 @@
       if (el.scrollTop < 80) loadOlderPosts();
       if (el.scrollTop + el.clientHeight >= el.scrollHeight - 120) loadNewerPosts();
     });
+    const detail = main.querySelector(".cx-view-detail");
+    for (const type of ["wheel", "touchmove", "pointerdown"]) detail.addEventListener(type, () => { threadScrollIntent++; }, {passive:true});
+    detail.addEventListener("keydown", e => {
+      if (!isEditableTarget(e.target) && ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(e.key)) threadScrollIntent++;
+    });
 
     syncCodePanelVisibility();
     renderCodePanel();
@@ -5115,10 +5372,18 @@
     main.dataset.eventsBound = "1";
     bindSearchEvents(main);
     const showAuthor = e => {
+      if (e.type === "focusin" && restoringAuthorFocus) return;
       const anchor = e.target.closest("[data-cx-user]");
-      if (anchor) openAuthorCard(anchor);
+      clearTimeout(authorHoverTimer);
+      if (!anchor) return;
+      if (e.type === "focusin") requestAnimationFrame(() => { if (document.activeElement === anchor && anchor.isConnected) openAuthorCard(anchor); });
+      else authorHoverTimer = setTimeout(() => { if (anchor.isConnected) openAuthorCard(anchor); }, 150);
     };
     main.addEventListener("mouseover", showAuthor);
+    main.addEventListener("mouseout", e => {
+      const anchor = e.target.closest("[data-cx-user]");
+      if (anchor && !anchor.contains(e.relatedTarget)) clearTimeout(authorHoverTimer);
+    });
     main.addEventListener("focusin", showAuthor);
     main.addEventListener("click", e => {
       const anchor = e.target.closest("[data-cx-user]");
@@ -5159,6 +5424,15 @@
       const locateBtn = e.target.closest("[data-locate-snippet]");
       if (locateBtn && main.contains(locateBtn)) {
         jumpToSource(Number(locateBtn.dataset.locateSnippet));
+        return;
+      }
+      const solutionLink = e.target.closest("[data-solution-locate]");
+      if (solutionLink) {
+        if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        e.preventDefault(); e.stopPropagation();
+        if (Number(solutionLink.closest(".cx-solutions")?.dataset.topicId) === topicIdFromPath(location.pathname)) {
+          jumpToSource(Number(solutionLink.dataset.solutionLocate));
+        } else navigateInApp(solutionLink.getAttribute("href"));
         return;
       }
       const branchLocate = e.target.closest("[data-branch-locate]");
@@ -5237,8 +5511,16 @@
       // 引用卡片「跳转源楼」
       const jumpSrc = e.target.closest(".cx-jump-src");
       if (jumpSrc && main.contains(jumpSrc)) {
-        const num = jumpSrc.closest(".cx-tool-card")?.dataset.jumpPost;
-        if (num) jumpToSource(Number(num));
+        // Use the real link for modified clicks, copying and opening a new tab.
+        if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        const target = new URL(jumpSrc.href, location.href);
+        if (target.origin !== location.origin) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const card = jumpSrc.closest(".cx-tool-card");
+        if (Number(card?.dataset.jumpTopic) === topicIdFromPath(location.pathname)) {
+          jumpToSource(Number(card.dataset.jumpPost));
+        } else navigateInApp(target.pathname + target.search + target.hash);
         return;
       }
       // 引用卡片折叠
@@ -5278,12 +5560,13 @@
       }
       // 面包屑项目名 → 该分类列表
       if (e.target.closest(".cx-crumb .cx-proj")) {
-        backToList();
+        backToList(true);
         return;
       }
       // 正文内站内链接软跳转
       const a = e.target.closest(".cx-view-detail a[href], .cx-view-list a[href], .cx-view-search a[href]");
       if (a && main.contains(a)) {
+        if (a.classList.contains("cx-list-native")) return;
         if (e.defaultPrevented) return;
         if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
         const href = a.getAttribute("href");
@@ -5304,10 +5587,14 @@
     if (composerCard) cxWireComposer(composerCard);
   }
 
-  function backToList() {
+  function backToList(categoryOnly = false) {
+    if (!categoryOnly && topicListOrigin) {
+      navigateInApp(topicListOrigin, true);
+      return;
+    }
     const catId = threadState.categoryId;
     const cat = catId ? categoryById(catId) : null;
-    navigateInApp(cat ? `/c/${cat.slug}/${cat.id}` : (listState.path || "/latest"));
+    navigateInApp(cat ? `/c/${cat.slug}/${cat.id}` : catId ? `/c/${catId}` : (listState.path || "/latest"));
   }
 
   function copyText(text) {
@@ -5357,15 +5644,13 @@
     main.querySelector(".cx-view-search").style.display = view === "search" ? "" : "none";
     main.querySelector(".codex-composer-wrap").style.display = view === "search" ? "none" : "";
     if (view === "search") cxClosePop();
+    syncComposerContext();
   }
 
   /** 顶栏面包屑 + 大标题 + composer placeholder 随路由同步 */
-  /* —— /new「新」下的「所有 / 话题 / 回复」筛选条（吸附原生 toggle，参照 im new-toggle.js）——
-     原生 wrapper 被本皮肤隐藏但仍留在 DOM：计数文本可读、点击可转发，
-     原生自行切换列表过滤；本地仅记忆选中态并跟手高亮，顺手 force 重拉当前列表。 */
+  // /new subsets belong to the URL/API. Hidden native buttons supply counts only.
   const CX_NEW_TOGGLE_WRAPPER = ".topic-replies-toggle-wrapper";
   const CX_NEW_TITLES = { all: "所有新话题和过去几天回复的话题", topics: "新话题", replies: "新回复" };
-  let cxNewToggleMod = null; // null = 尚未选择：首次访问读原生当前态作为初始值
 
   function cxNativeNewBtn(mod) {
     try { return document.querySelector(`${CX_NEW_TOGGLE_WRAPPER} .topics-replies-toggle.${mod}`); }
@@ -5405,25 +5690,17 @@
         const btn = e.target.closest(".cx-new-toggle-btn");
         if (!btn || !row.contains(btn)) return;
         const mod = btn.dataset.mod;
-        cxNewToggleMod = mod; // 本地点选为选中项，立即高亮
-        // 转发原生按钮：原生的过滤交互由其自身事件委托处理
-        try { cxNativeNewBtn(mod)?.click?.(); } catch { /* ignore */ }
-        // 顺手 force 重拉当前列表，尽量跟随
-        if (listState.apiPath) loadList(listState.apiPath, true);
+        const url = new URL(location.href);
+        if (mod === "all") url.searchParams.delete("subset");
+        else url.searchParams.set("subset", mod);
+        url.searchParams.delete("page");
+        const target = url.pathname + url.search + url.hash;
+        if (target === location.pathname + location.search + location.hash) loadList(listState.apiPath, true);
+        else navigateInApp(target);
       });
     }
-    // 选中态：优先本地记忆；首次访问（无记忆）才读原生当前态
-    if (!cxNewToggleMod) {
-      let nat = "all";
-      const wrapper = document.querySelector(CX_NEW_TOGGLE_WRAPPER);
-      if (wrapper) {
-        for (const m of ["topics", "replies", "all"]) {
-          if (wrapper.querySelector(`.topics-replies-toggle.${m}`)?.classList?.contains("active")) { nat = m; break; }
-        }
-      }
-      cxNewToggleMod = nat;
-    }
-    const active = cxNewToggleMod;
+    const subset = new URLSearchParams(location.search).get("subset");
+    const active = ["topics", "replies"].includes(subset) ? subset : "all";
     const html =
       cxNewButtonHtml("all", "所有", cxNewCount(cxNativeNewBtn("all")), active === "all") +
       cxNewButtonHtml("topics", "话题", cxNewCount(cxNativeNewBtn("topics")), active === "topics") +
@@ -5438,6 +5715,7 @@
   function syncChrome() {
     const main = document.querySelector(".codex-main");
     if (!main) return;
+    syncComposerContext();
     const pathname = location.pathname;
     const proj = main.querySelector(".cx-crumb .cx-proj");
     const model = main.querySelector(".cx-crumb .cx-model");
@@ -5509,15 +5787,56 @@
 
   const listState = {
     path: "",
+    routeKey: "",
     apiPath: "",
     moreUrl: null,
     loading: false,
-    failedAt: 0,
+    ready: false,
+    moreError: "",
+    completedPages: new Set(),
     topics: []
   };
+  const listSnapshots = new Map();
+  let topicListOrigin = "";
+  let listRestoreKey = "";
+
+  function listViewport() {
+    const el = document.querySelector(".cx-view-list");
+    if (!el) return null;
+    const top = el.getBoundingClientRect().top;
+    const row = [...el.querySelectorAll(".cx-trow")].find(r => r.getBoundingClientRect().bottom > top);
+    return { top: el.scrollTop, id: row?.dataset.topicId, offset: row ? row.getBoundingClientRect().top - top : 0 };
+  }
+
+  function restoreListViewport(position) {
+    const el = document.querySelector(".cx-view-list");
+    if (!el || !position) return;
+    el.scrollTop = position.top;
+    const row = [...el.querySelectorAll(".cx-trow")].find(r => r.dataset.topicId === position.id);
+    if (row) el.scrollTop += row.getBoundingClientRect().top - el.getBoundingClientRect().top - position.offset;
+  }
+
+  function rememberListSnapshot() {
+    if (!listState.ready || listState.routeKey !== requestPage || !requestPage.startsWith("list:")) return;
+    // Cancelling a transport must not discard successfully loaded pages. Store data
+    // separately from coordinators so returning acquires a fresh request owner.
+    listSnapshots.delete(requestPage);
+    listSnapshots.set(requestPage, { ...listState, loading: false, position: listViewport(),
+      completedPages: new Set(listState.completedPages) });
+    while (listSnapshots.size > 8) listSnapshots.delete(listSnapshots.keys().next().value);
+  }
+
+  function listPageKey(path) {
+    const url = new URL(path, location.origin);
+    url.searchParams.sort();
+    return url.pathname.replace(/\.json$/, "") + url.search;
+  }
 
   function trowHtml(topic) {
     const unread = topicUnread(topic);
+    const unseen = topic.unseen === true;
+    const hasUnread = unseen || unread > 0;
+    const read = Number(topic.last_read_post_number) > 0 && !hasUnread;
     const replies = Math.max(0, (topic.posts_count || 1) - 1);
     const cat = topic.category_id ? categoryById(topic.category_id) : null;
     const sub = topic.excerpt
@@ -5526,9 +5845,9 @@
           .filter(Boolean).join(" · ");
     const status = topic.pinned
       ? `<span class="cx-trow-pin">${ICONS.pin}</span>`
-      : `<span class="cx-trow-dot${unread ? " cx-unread" : ""}"></span>`;
+      : `<span class="cx-trow-dot${hasUnread ? " cx-unread" : ""}" title="${unseen ? "新话题" : unread ? `${unread} 条未读回复` : read ? "已读" : ""}"></span>`;
     return `
-      <div class="cx-trow${unread ? "" : " cx-read"}" data-href="${escapeHtml(topicHref(topic))}" data-topic-id="${topic.id}">
+      <div class="cx-trow${read ? " cx-read" : ""}" data-href="${escapeHtml(topicHref(topic))}" data-topic-id="${topic.id}">
         ${status}
         <div class="cx-trow-texts">
           <div class="cx-trow-title">${escapeHtml(topic.title)}</div>
@@ -5536,7 +5855,7 @@
         </div>
         <div class="cx-trow-meta">
           <span>${replies} 回复</span>
-          <span>${topic.pinned ? "置顶" : escapeHtml(formatTime(topic.last_activity_at))}</span>
+          <span>${topic.pinned ? "置顶" : escapeHtml(formatTime(topic.bumped_at || topic.last_posted_at || topic.last_activity_at || topic.created_at))}</span>
         </div>
       </div>`;
   }
@@ -5549,71 +5868,100 @@
       if (i > 0) rows.push(`<div class="cx-trow-sep"></div>`);
       rows.push(trowHtml(t));
     });
-    rows.push(
-      `<div class="cx-list-status">${
-        listState.loading ? "加载中…" :
-        listState.moreUrl ? "滚动加载更多…" :
-        (listState.topics.length ? "没有更多了" : "暂无话题")
-      }</div>`
-    );
+    rows.push('<div class="cx-list-status"></div>');
     box.innerHTML = rows.join("");
+    renderListStatus();
     syncChrome();
     renderRailDynamic();
   }
 
+  function renderListStatus() {
+    const status = document.querySelector(".cx-thread-rows .cx-list-status");
+    if (!status) return;
+    if (listState.moreError) {
+      status.innerHTML = `更多话题加载失败（${escapeHtml(listState.moreError)}） <button type="button" class="cx-btn-more-retry">重试</button>`;
+      status.querySelector("button").addEventListener("click", () => loadMoreList(true));
+    } else status.textContent = listState.loading ? "加载中…" : listState.moreUrl ? "滚动加载更多…" :
+      (listState.topics.length ? "没有更多了" : "暂无话题");
+  }
+
   function applyListJson(data, append) {
-    const topics = (data.topic_list && data.topic_list.topics) || [];
+    if (!Array.isArray(data?.topic_list?.topics)) throw new Error("话题列表响应无效");
+    const topics = data.topic_list.topics;
     const existing = new Set(append ? listState.topics.map((t) => t.id) : []);
-    const fresh = topics.filter((t) => !existing.has(t.id));
-    listState.topics = append ? listState.topics.concat(fresh) : topics;
+    const fresh = topics.filter((t) => {
+      if (existing.has(t.id)) return false;
+      existing.add(t.id);
+      return true;
+    });
+    const position = append ? listViewport() : null;
+    listState.topics = append ? listState.topics.concat(fresh) : fresh;
     const more = data.topic_list && data.topic_list.more_topics_url;
-    listState.moreUrl = more ? more.replace(/\.json\b/, ".json") : null;
+    const next = more ? new URL(more, location.origin) : null;
+    listState.moreUrl = next && next.origin === location.origin && topics.length &&
+      !listState.completedPages.has(listPageKey(next.href)) ? next.pathname + next.search : null;
+    listState.ready = true;
+    if (!append && listState.apiPath === "/latest.json") recentTopicsCache = listState.topics;
     renderListRows();
+    restoreListViewport(position);
   }
 
   async function loadList(apiPath, force) {
-    if (!apiPath || !isThemeActive()) return;
+    if (!apiPath || !isThemeActive() || !isHomePath(location.pathname)) return;
     const reqKey = `list:${apiPath}`;
+    const ownerPage = pageRequestKey();
     if (!force && listCoordinator.activeKey === reqKey && listCoordinator.status === "loading") return;
     if (!force && listCoordinator.activeKey === reqKey && listCoordinator.loadedKey === reqKey) {
       syncAppChrome();
       renderRailDynamic();
       return;
     }
-    // 手动重试 (force) 绕过失败冷却；自动请求受 8 秒防风暴保护
-    if (!force && listCoordinator.activeKey === reqKey && listState.failedAt && Date.now() - listState.failedAt < 8000) return;
+    if (!force && listRestoreKey === ownerPage && listSnapshots.has(ownerPage)) {
+      const saved = listSnapshots.get(ownerPage);
+      listRestoreKey = "";
+      const req = listCoordinator.begin(reqKey);
+      Object.assign(listState, saved, { completedPages: new Set(saved.completedPages) });
+      listCoordinator.succeed(req.requestId, reqKey);
+      renderListRows();
+      restoreListViewport(saved.position);
+      return;
+    }
+    // DOM churn is not a retry gesture, even after a delay. A failed route stays
+    // quiet until an explicit retry or navigation acquires a different owner.
+    if (!force && listCoordinator.activeKey === reqKey && listCoordinator.status === "error") return;
 
     listMoreCoordinator.cancel();
+    listRestoreKey = "";
+    listSnapshots.delete(ownerPage);
     const req = listCoordinator.begin(reqKey);
-    const ownerPage = pageRequestKey();
+    const changed = listState.routeKey !== ownerPage;
+    if (changed) listState.topics = [];
+    listState.routeKey = ownerPage;
     listState.loading = true;
+    listState.ready = false;
+    listState.moreError = "";
+    listState.completedPages = new Set();
     listState.moreUrl = null;
     listState.apiPath = apiPath;
-    listState.path = location.pathname;
+    listState.path = location.pathname + location.search + location.hash;
     renderListRows();
+    if (changed) document.querySelector(".cx-view-list").scrollTop = 0;
 
     try {
       const data = await api(apiPath, undefined, req.signal);
       if (!req.isCurrent() || !isThemeActive() || pageRequestKey() !== ownerPage) return;
-      listCoordinator.succeed(req.requestId, reqKey);
-      listState.failedAt = 0;
       listState.loading = false;
+      listState.completedPages.add(listPageKey(apiPath));
       applyListJson(data, false);
+      listCoordinator.succeed(req.requestId, reqKey);
     } catch (err) {
       if (err && err.name === "AbortError") return;
       if (!req.isCurrent() || !isThemeActive() || pageRequestKey() !== ownerPage) return;
       listCoordinator.fail(req.requestId, reqKey, err);
-      listState.failedAt = Date.now();
-      const status = /HTTP (\d+)/.exec(err && err.message || "")?.[1];
       const box = document.querySelector(".cx-thread-rows");
       if (box) {
-        box.innerHTML = `<div class="cx-list-status">列表加载失败${
-          status === "403"
-            ? "（HTTP 403：可能被拦截或未登录，登录后重试）"
-            : status ? `（HTTP ${status}）` : ""
-        }，<button class="cx-btn-retry" style="margin-left:6px;padding:2px 8px;cursor:pointer;background:var(--cx-brand);color:#fff;border:none;border-radius:4px;">点击重试</button></div>`;
+        box.innerHTML = `<div class="cx-list-status">列表加载失败（${escapeHtml(apiFailureText(err))}），<button class="cx-btn-retry" style="margin-left:6px;padding:2px 8px;cursor:pointer;background:var(--cx-brand);color:#fff;border:none;border-radius:4px;">点击重试</button> <a class="cx-list-native" href="${escapeHtml(buildNativeUrl(location.href))}" target="_blank" rel="noopener noreferrer">打开原版</a></div>`;
         box.querySelector(".cx-btn-retry")?.addEventListener("click", () => {
-          listState.failedAt = 0;
           loadList(apiPath, true);
         });
       }
@@ -5624,9 +5972,11 @@
     }
   }
 
-  async function loadMoreList() {
-    if (!isThemeActive() || !isHomePath(location.pathname) || !listState.moreUrl || listState.loading) return;
-    const ownerPage = location.pathname;
+  async function loadMoreList(retry = false) {
+    if (!isThemeActive() || !isHomePath(location.pathname) || !listState.ready ||
+        listCoordinator.status !== "ready" || listCoordinator.loadedKey !== `list:${listState.apiPath}` ||
+        listState.routeKey !== pageRequestKey() || !listState.moreUrl || listState.loading || (listState.moreError && !retry)) return;
+    const ownerPage = pageRequestKey();
     const ownerApi = listState.apiPath;
     const ownerKey = listCoordinator.activeKey;
     const ownerVersion = listCoordinator.currentRequestId;
@@ -5635,16 +5985,24 @@
     // Transport cancellation alone cannot prevent an already-resolved response/finally
     // from altering a replacement list (or a new request for the same page).
     const isCurrent = () => req.isCurrent() && listCoordinator.isCurrent(ownerVersion, ownerKey) &&
-      listState.apiPath === ownerApi && location.pathname === ownerPage && isThemeActive();
+      listState.apiPath === ownerApi && pageRequestKey() === ownerPage && isThemeActive();
     listState.loading = true;
+    listState.moreError = "";
+    renderListStatus();
     try {
       const data = await api(moreUrl, undefined, req.signal);
       if (!isCurrent()) return;
-      listMoreCoordinator.succeed(req.requestId, req.key);
       listState.loading = false;
+      listState.completedPages.add(listPageKey(moreUrl));
       applyListJson(data, true);
-    } catch { /* 保留现状 */ } finally {
-      if (isCurrent()) listState.loading = false;
+      listMoreCoordinator.succeed(req.requestId, req.key);
+    } catch (error) {
+      if (!isCurrent() || error.name === "AbortError") return;
+      listState.completedPages.delete(listPageKey(moreUrl));
+      listState.moreError = apiFailureText(error);
+      listMoreCoordinator.fail(req.requestId, req.key, error);
+    } finally {
+      if (isCurrent()) { listState.loading = false; renderListStatus(); }
     }
   }
 
@@ -5654,6 +6012,37 @@
    * 把原生 cooked DOM 装饰成 Codex 风格：
    * 行内 code → 芯片；pre → 带头栏的代码块；引用 → 可折叠工具卡片；图片 lazy
    */
+  // A quote owns both a topic and a post number. Never interpret a cross-topic
+  // floor as belonging to the current thread after replacing Discourse's markup.
+  function quoteSource(quote) {
+    const positive = value => /^\d+$/.test(String(value || "")) && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : null;
+    const topicAttr = quote.getAttribute("data-topic");
+    const postAttr = quote.getAttribute("data-post");
+    let linked = null;
+    for (const anchor of quote.querySelectorAll(":scope > .title a[href]")) {
+      try {
+        const url = new URL(anchor.getAttribute("href"), location.origin);
+        const match = /^(\/t\/(?:[^/]+\/)?(\d+))(?:\/(\d+))?\/?$/.exec(url.pathname);
+        if (!/^https?:$/.test(url.protocol) || !match || !positive(match[2])) continue;
+        linked = { url, base:match[1], topic:positive(match[2]), post:positive(match[3]) };
+        break;
+      } catch { /* An invalid title link is not a navigation target. */ }
+    }
+    if (topicAttr !== null && !positive(topicAttr) && !linked) return null;
+    if (postAttr !== null && !positive(postAttr)) return null;
+    const topic = positive(topicAttr) || linked?.topic || threadState.topicId;
+    const post = positive(postAttr) || linked?.post || (positive(topicAttr) || linked ? 1 : null);
+    if (!positive(topic) || !post) return null;
+    let href = "/t/topic/" + topic + "/" + post;
+    let topicId = topic;
+    if (linked && (linked.topic === topic || linked.url.origin !== location.origin)) {
+      linked.url.pathname = linked.base + "/" + post;
+      if (linked.url.origin !== location.origin) { href = linked.url.href; topicId = null; }
+      else if (topicIdFromPath(linked.url.pathname) === topic) href = linked.url.pathname + linked.url.search + linked.url.hash;
+    }
+    return { href, topicId, postNumber:post };
+  }
+
   function decorateCooked(root) {
     if (!root) return;
 
@@ -5686,7 +6075,8 @@
     // Discourse 引用 aside.quote → 可折叠工具调用卡片
     root.querySelectorAll("aside.quote").forEach((quote) => {
       if (quote.closest(".cx-tool-card")) return;
-      const postNo = quote.getAttribute("data-post");
+      const source = quoteSource(quote);
+      const postNo = source?.postNumber;
       const titleEl = quote.querySelector(":scope > .title");
       const username = (titleEl?.textContent || "").replace(/[:：]\s*$/, "").trim();
       const label = postNo
@@ -5695,13 +6085,15 @@
       const body = quote.querySelector(":scope > blockquote");
       const card = document.createElement("div");
       card.className = "cx-tool-card";
-      if (postNo) card.dataset.jumpPost = postNo; // 引用跳源楼
+      if (source) {
+        card.dataset.jumpPost = String(source.postNumber);
+        card.dataset.jumpTopic = source.topicId ? String(source.topicId) : "";
+      }
       const head = document.createElement("div");
       head.className = "cx-tool-card-head";
-      head.innerHTML =
-        `${ICONS.quote}<span>${escapeHtml(label)}</span>` +
-        (postNo ? `<span class="cx-jump-src" title="跳转源楼">${ICONS.external}</span>` : "") +
-        `${ICONS.chevronRightSm}`;
+      head.innerHTML = ICONS.quote + "<span>" + escapeHtml(label) + "</span>" +
+        (source ? '<a class="cx-jump-src" href="' + escapeHtml(source.href) + '" title="打开引用来源" aria-label="打开引用来源，第 ' + postNo + ' 楼">' + ICONS.external + '</a>' : "") +
+        ICONS.chevronRightSm;
       const bodyEl = document.createElement("div");
       bodyEl.className = "cx-tool-card-body";
       if (body) {
@@ -5808,7 +6200,7 @@
 
   /** 点击引用卡片「跳转源楼」：记录当前位置，平滑滚到被引用楼层并高亮 */
   /** 引用卡片「跳转源楼」：本地命中直接滚；未加载则远端拉取包含该楼的窗口再滚，并高亮 */
-  async function jumpToSource(postNumber) {
+  async function jumpToSource(postNumber, options = {}) {
     const scroller = document.querySelector(".cx-view-detail");
     if (!scroller) return;
     const n = Math.floor(Number(postNumber));
@@ -5816,7 +6208,8 @@
       cxToast("无法跳转：楼层号无效", "error");
       return;
     }
-    if (scrollToTurnNum(scroller, n)) return;
+    if (options.allowed && !options.allowed()) return;
+    if (scrollToTurnNum(scroller, n, options)) return;
 
     // 目标楼尚未加载：先从远端取一个包含它的窗口
     if (!threadState.topicId) {
@@ -5832,7 +6225,7 @@
     const requestedScrollTop = scroller.scrollTop;
     threadState.loading = true;
     try {
-      const data = await api(`/t/${targetTopicId}/${n}.json`);
+      const data = await api(`/t/${targetTopicId}/${n}.json`, undefined, topicCoordinator.controller?.signal);
       if (!topicCoordinator.isCurrent(curReqId) || threadState.topicId !== targetTopicId || !isThemeActive()) return;
       const posts = (data.post_stream && data.post_stream.posts) || [];
       if (!posts.length) {
@@ -5869,9 +6262,9 @@
         ? n
         : (posts[posts.length - 1].post_number || n);
       // A slow lookup must not reclaim the viewport after the reader moves on.
-      if (!readerMoved) scrollToTurnNum(scroller, landed);
-    } catch {
-      cxToast(`#${n} 楼加载失败`, "error");
+      if (!readerMoved && (!options.allowed || options.allowed())) scrollToTurnNum(scroller, landed, options);
+    } catch (error) {
+      if (error.name !== "AbortError" && topicCoordinator.isCurrent(curReqId)) cxToast(`#${n} 楼加载失败`, "error");
     } finally {
       if (topicCoordinator.isCurrent(curReqId)) {
         threadState.loading = false;
@@ -5880,17 +6273,18 @@
   }
 
   /** 滚到指定楼层并高亮；未找到返回 false */
-  function scrollToTurnNum(scroller, postNumber) {
+  function scrollToTurnNum(scroller, postNumber, options = {}) {
     const target = scroller.querySelector(
       `.cx-turn-user[data-post-number="${postNumber}"], .cx-turn-agent[data-post-number="${postNumber}"]`
     );
     if (!target) return false;
-    quoteJumpStack.push({ topicId: threadState.topicId, scrollTop: scroller.scrollTop });
-    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (!options.automatic) quoteJumpStack.push({ topicId: threadState.topicId, scrollTop: scroller.scrollTop });
+    if (options.automatic) scroller.scrollTop += target.getBoundingClientRect().top - scroller.getBoundingClientRect().top - (options.offset || 0);
+    else target.scrollIntoView({ behavior: "smooth", block: "center" });
     target.classList.remove("cx-jump-highlight");
     void target.offsetWidth;
     target.classList.add("cx-jump-highlight");
-    showJumpBackBtn();
+    if (!options.automatic) showJumpBackBtn();
     return true;
   }
 
@@ -7819,6 +8213,7 @@
       activeSnippetId = null;
       closeWorkspaceMenu();
       renderCodePanel();
+      refreshProjectActivities();
       return true;
     }
     const close = e.target.closest("[data-close-file]");
@@ -7918,6 +8313,8 @@
     categoryId: null,
     postsCount: 0,
     views: 0,
+    acceptedAnswers: [],
+    solved: false,
     postsByNum: {}         // post_number -> post（投票组件 / 引用跳转用）
   };
 
@@ -8014,10 +8411,45 @@
     const box = detailContainer();
     if (!box) return;
     syncReplyParents(box);
+    syncPostBoosts(box);
     for (const slot of box.querySelectorAll(".cx-branch-slot")) {
       const post = threadState.postsByNum[slot.dataset.branchParent];
       const state = replyBranchState(post);
       if (state) renderReplyBranch(slot, state);
+    }
+  }
+
+  // Boost comments belong to their post and never become timeline/read-tracking nodes.
+  function boostsHtml(post) {
+    if (!Array.isArray(post?.boosts)) return "";
+    const seen = new Set();
+    const chips = post.boosts.filter(b => {
+      if (!b || (b.id != null && seen.has(String(b.id)))) return false;
+      if (b.id != null) seen.add(String(b.id));
+      return true;
+    }).map(b => {
+      const template = document.createElement("template");
+      template.innerHTML = String(b.cooked || "");
+      template.content.querySelectorAll("script,style,iframe,object").forEach(el => el.remove());
+      template.content.querySelectorAll("img").forEach(el => el.replaceWith(el.classList.contains("emoji") ? el.getAttribute("alt") || el.getAttribute("title") || "" : ""));
+      template.content.querySelectorAll("br").forEach(el => el.replaceWith("\n"));
+      template.content.querySelectorAll("p,div,li").forEach(el => el.append("\n"));
+      const text = (template.content.textContent || b.raw || "").trim();
+      const chars = Array.from(text);
+      const content = chars.length > 70
+        ? `<details><summary>${escapeHtml(chars.slice(0,70).join(""))}… 展开</summary><p class="cx-boost-full">${escapeHtml(text)}</p></details>`
+        : `<span>${escapeHtml(text || "（空跟评）")}</span>`;
+      return `<div class="cx-boost-chip"><span aria-hidden="true">🚀</span>${authorLink(b.user || {})}<span aria-hidden="true">·</span>${content}</div>`;
+    }).join("");
+    return chips ? `<div class="cx-boost-bar" role="group" aria-label="小火箭跟评">${chips}</div>` : "";
+  }
+  function syncPostBoosts(box) {
+    for (const slot of box.querySelectorAll(".cx-boost-slot")) {
+      const post = threadState.postsByNum[slot.dataset.boostPost];
+      const signature = JSON.stringify(post?.boosts || []);
+      if (slot.dataset.signature === signature) continue;
+      slot.dataset.signature = signature;
+      slot.innerHTML = boostsHtml(post);
     }
   }
 
@@ -8167,14 +8599,13 @@
 
   function activityForPost(turn) {
     const pid = Number(turn.dataset.postId || turn.dataset.postNumber || 0);
-    const key = `${threadState.topicId}:${pid}`;
+    const key = `${activeProject.id}:${threadState.topicId}:${pid}`;
     if (activityByPost.has(key)) return activityByPost.get(key);
     const rnd = mulberry32(((pid + 1) * 2654435761 ^ (threadState.topicId || 0)) >>> 0);
     const pick = (pool) => pool[Math.floor(rnd() * pool.length)];
     const files = activeProject.files;
     const first = files[Math.floor(rnd() * files.length)];
-    const second = pick(files.filter(file => file !== first));
-    const inspected = rnd() < 0.5 ? [first] : [first, second];
+    const inspected = [first];
     const directory = files[0].path.split("/").slice(0, -1).join("/");
     const activity = {
       seconds: 4 + Math.floor(rnd() * 38),
@@ -8190,7 +8621,6 @@
       command: `rg --files ${directory}`,
       output: files.filter(file => file.path.startsWith(directory + "/")).map(file => file.path).join("\n")
     });
-    activity.integration = rnd() < 0.5;
     for (const tool of activity.tools) {
       tool.seconds = 1 + Math.floor(rnd() * 3);
       tool.open = false;
@@ -8225,17 +8655,131 @@
       const wrapper = document.createElement("div");
       wrapper.className = "cx-turn-activity";
       wrapper.dataset.codexDecorative = "1";
+      let toolDetails;
       if (tools) {
         const commands = document.createElement("div");
         commands.className = "cx-tools-body";
         for (const tool of activity.tools) commands.appendChild(buildActivityDisclosure("cx-runline", `已在 ${tool.seconds}s 内运行 ${tool.command}`,
           `<pre>${escapeHtml(`$ ${tool.command}\n\n${tool.output}`)}</pre>`, tool, "open", "terminal"));
-        wrapper.appendChild(buildActivityDisclosure("cx-tools", activity.integration ? "已使用 Codey Fastctx 集成运行了命令" : "运行了命令",
-          commands, activity, "toolsOpen", activity.integration ? "integration" : "terminal"));
+        toolDetails = buildActivityDisclosure("cx-tools", "运行了命令", commands, activity, "toolsOpen", "terminal");
       }
-      if (thinking) wrapper.appendChild(buildActivityDisclosure("cx-think", `用时 ${activity.seconds}秒`,
-        `<div class="cx-think-body">${escapeHtml(activity.thought)}</div>`, activity, "thoughtOpen"));
+      if (thinking) {
+        const group = buildActivityDisclosure("cx-think", `已处理 ${activity.seconds} 秒`,
+          `<div class="cx-think-body">${escapeHtml(activity.thought)}</div>`, activity, "thoughtOpen", "clock");
+        if (toolDetails) group.appendChild(toolDetails);
+        wrapper.appendChild(group);
+      } else if (toolDetails) wrapper.appendChild(toolDetails);
       turn.insertBefore(wrapper, cooked);
+    });
+  }
+
+  function refreshProjectActivities() {
+    const box = detailContainer(), scroller = box?.closest(".cx-view-detail");
+    if (!box || !scroller) return;
+    const top = scroller.getBoundingClientRect().top;
+    const anchor = [...box.querySelectorAll(".cx-cooked, .cx-turn-user-bubble")].find(el => el.getBoundingClientRect().bottom > top);
+    const before = anchor?.getBoundingClientRect().top;
+    box.querySelectorAll(".cx-turn-activity").forEach(el => el.remove());
+    sprinkleActivity(box);
+    if (anchor) scroller.scrollTop += anchor.getBoundingClientRect().top - before;
+  }
+
+  // Solved stores accepted answers outside post.cooked. New servers provide an
+  // array; older servers provide one accepted_answer with a short excerpt.
+  function updateTopicSolutions(data, reset = false) {
+    const hasMany = Object.prototype.hasOwnProperty.call(data, "accepted_answers");
+    const hasSingle = Object.prototype.hasOwnProperty.call(data, "accepted_answer");
+    const hasFlag = Object.prototype.hasOwnProperty.call(data, "has_accepted_answer");
+    if (!reset && !hasMany && !hasSingle && !hasFlag) return;
+    const raw = hasMany ? data.accepted_answers : hasSingle && data.accepted_answer ? [data.accepted_answer] : [];
+    const seen = new Set();
+    const answers = (Array.isArray(raw) ? raw : []).filter(answer => {
+      const number = Number(answer?.post_number);
+      if (!answer || !Number.isSafeInteger(number) || number < 1 ||
+          (answer.topic_id != null && Number(answer.topic_id) !== threadState.topicId) || seen.has(number)) return false;
+      seen.add(number);
+      return true;
+    }).map(answer => ({...answer, post_number:Number(answer.post_number)}));
+    threadState.acceptedAnswers = data.has_accepted_answer === false ? [] : answers;
+    threadState.solved = data.has_accepted_answer !== false && (data.has_accepted_answer === true || answers.length > 0);
+  }
+
+  function syncTopicSolutions() {
+    const box = detailContainer();
+    if (!box) return;
+    const answers = threadState.acceptedAnswers || [];
+    const accepted = new Set(answers.map(answer => answer.post_number));
+    for (const turn of box.querySelectorAll(":scope > [data-post-number]")) {
+      const meta = turn.nextElementSibling;
+      if (!meta?.matches(".cx-worked, .cx-turn-meta")) continue;
+      const badge = meta.querySelector(".cx-solution-badge");
+      if (accepted.has(Number(turn.dataset.postNumber))) {
+        if (!badge) {
+          const el = document.createElement("span");
+          el.className = "cx-solution-badge"; el.textContent = "解决方案";
+          meta.appendChild(el);
+        }
+      } else badge?.remove();
+    }
+    let panel = box.querySelector(":scope > .cx-solutions");
+    if (!threadState.solved) { panel?.remove(); return; }
+    if (!panel) {
+      panel = document.createElement("section");
+      panel.className = "cx-solutions";
+      panel.setAttribute("aria-label", "已采纳的解决方案");
+    }
+    panel.dataset.topicId = String(threadState.topicId);
+    const first = box.querySelector(':scope > .cx-turn-user[data-post-number="1"]');
+    const anchor = first?.nextElementSibling?.matches(".cx-turn-meta") ? first.nextElementSibling : first;
+    if (anchor) { if (anchor.nextElementSibling !== panel) anchor.after(panel); }
+    else if (box.firstElementChild !== panel) box.prepend(panel);
+    const rows = answers.map(answer => {
+      const post = threadState.postsByNum[answer.post_number];
+      const raw = answer.excerpt || answer.cooked || post?.cooked || "";
+      const plain = searchText(String(raw).replace(/<br\s*\/?>|<\/(?:p|div|li|h[1-6])>/gi, "\n")).trim();
+      return {...answer, preview:plain.length > 500 ? plain.slice(0, 500) + "…" : plain};
+    });
+    const signature = JSON.stringify(rows);
+    if (panel.dataset.signature === signature) return;
+    const rendered = panel.dataset.signature !== undefined;
+    const open = new Set([...panel.querySelectorAll(".cx-solution-item[open]")].map(el => Number(el.dataset.solutionPost)));
+    panel.dataset.signature = signature;
+    panel.replaceChildren();
+    const heading = document.createElement("h3");
+    heading.className = "cx-solutions-title";
+    heading.innerHTML = ICONS.check;
+    heading.append("已解决" + (rows.length ? " · " + rows.length + " 条解决方案" : ""));
+    panel.appendChild(heading);
+    if (!rows.length) {
+      const empty = document.createElement("p");
+      empty.className = "cx-solution-excerpt"; empty.textContent = "解决方案内容当前不可见。";
+      panel.appendChild(empty);
+    }
+    rows.forEach((answer, index) => {
+      const item = document.createElement("details");
+      item.className = "cx-reply-branch cx-solution-item";
+      item.dataset.solutionPost = String(answer.post_number);
+      item.open = open.has(answer.post_number) || (!rendered && index === 0);
+      const summary = document.createElement("summary");
+      summary.className = "cx-disclosure-summary";
+      const author = document.createElement("span");
+      author.innerHTML = authorLink(answer);
+      const meta = document.createElement("span");
+      meta.className = "cx-solution-meta";
+      meta.textContent = "#" + answer.post_number + (answer.created_at ? " · " + formatTime(answer.created_at) : "");
+      const chevron = document.createElement("span");
+      chevron.className = "cx-branch-chevron"; chevron.setAttribute("aria-hidden", "true"); chevron.innerHTML = ICONS.chevronDown;
+      summary.append(author, meta, chevron);
+      // Previews are excerpts, not complete posts: never add timeline/read-tracking
+      // selectors or decorate them as if they were additional rendered floors.
+      const body = document.createElement("div"); body.className = "cx-solution-body";
+      const excerpt = document.createElement("p"); excerpt.className = "cx-solution-excerpt";
+      excerpt.textContent = answer.preview || "展开原楼查看完整内容。";
+      const link = document.createElement("a");
+      link.dataset.solutionLocate = String(answer.post_number);
+      link.href = topicHref({id:threadState.topicId, slug:threadState.slug}) + "/" + answer.post_number;
+      link.textContent = "阅读更多 · 定位 #" + answer.post_number;
+      body.append(excerpt, link); item.append(summary, body); panel.appendChild(item);
     });
   }
 
@@ -8268,6 +8812,7 @@
 
   function turnsHtml(posts) {
     return posts.map((p) => (p.post_number === 1 ? opTurnHtml(p) : agentTurnHtml(p)) +
+      `<div class="cx-boost-slot" data-boost-post="${Number(p.post_number)}"></div>` +
       `<div class="cx-branch-slot" data-branch-parent="${Number(p.post_number)}"></div>`).join("");
   }
 
@@ -8333,6 +8878,7 @@
     const box = detailContainer();
     if (!box) return;
     syncReplyBranches();
+    syncTopicSolutions();
     box.querySelector(".cx-turn-divider")?.remove();
     const total = Math.max(0, (threadState.postsCount || 0) - 1);
     const loaded = threadState.renderedLastIdx - threadState.renderedFirstIdx + 1;
@@ -8342,6 +8888,27 @@
         `<div class="cx-turn-divider">以上为 ${total} 条回复中的最近 ${Math.max(0, loaded - 1)} 条 · 向上滚动加载更早</div>`
       );
     }
+  }
+
+  const topicPositions = new Map();
+  const topicEntryPositions = new Map();
+  let restoreTopicEntry = false;
+  let threadScrollIntent = 0;
+  function rememberTopicPosition() {
+    const scroller = document.querySelector(".cx-view-detail");
+    if (!scroller || scroller.style.display === "none" || topicCoordinator.status !== "ready" ||
+        requestPage !== `topic:${threadState.topicId}` || !threadState.positionKey) return;
+    const top = scroller.getBoundingClientRect().top;
+    const turn = [...scroller.querySelectorAll(".cx-thread-posts > [data-post-number]")]
+      .find(el => el.getBoundingClientRect().bottom > top);
+    if (!turn) return;
+    topicPositions.delete(threadState.positionKey);
+    const position = {number:Number(turn.dataset.postNumber), offset:turn.getBoundingClientRect().top - top};
+    topicPositions.set(threadState.positionKey, position);
+    topicEntryPositions.delete(threadState.positionEntryKey);
+    topicEntryPositions.set(threadState.positionEntryKey, position);
+    if (topicPositions.size > 40) topicPositions.delete(topicPositions.keys().next().value);
+    if (topicEntryPositions.size > 40) topicEntryPositions.delete(topicEntryPositions.keys().next().value);
   }
 
   async function loadTopic(topicId, force) {
@@ -8358,6 +8925,12 @@
     const req = topicCoordinator.begin(reqKey);
     const ownerPage = pageRequestKey();
     const targetPost = /\/\d+\/(\d+)\/?$/.exec(location.pathname)?.[1];
+    const positionKey = `${composerContext()?.actor || "guest"}:${topicId}`;
+    const positionEntryKey = `${composerContext()?.actor || "guest"}:${location.pathname}${location.search}`;
+    const savedPosition = (restoreTopicEntry && topicEntryPositions.get(positionEntryKey)) || topicPositions.get(positionKey);
+    restoreTopicEntry = false;
+    const scrollIntent = threadScrollIntent;
+    let resumePost = Number(targetPost) || savedPosition?.number || 0;
     threadState.loading = true;
     threadState.postsByNum = {};
     clearQuoteJumpHistory();
@@ -8372,9 +8945,16 @@
       if (!req.isCurrent() || !isThemeActive() || pageRequestKey() !== ownerPage) return;
 
       threadState.topicId = topicId;
+      threadState.positionKey = positionKey;
+      threadState.positionEntryKey = positionEntryKey;
       topicCoordinator.succeed(req.requestId, reqKey);
 
       const posts = (data.post_stream && data.post_stream.posts) || [];
+      if (!resumePost && Number(data.last_read_post_number) > 0) {
+        const read = Number(data.last_read_post_number);
+        const highest = Number(data.highest_post_number) || Math.max(0, ...posts.map(p => Number(p.post_number)));
+        resumePost = highest > read ? (posts.find(p => p.post_number > read)?.post_number || read + 1) : read;
+      }
       threadState.stream = (data.post_stream && data.post_stream.stream) || posts.map((p) => p.id);
       threadState.renderedFirstIdx = threadState.stream.indexOf(posts.length ? posts[0].id : -1);
       if (threadState.renderedFirstIdx < 0) threadState.renderedFirstIdx = 0;
@@ -8391,6 +8971,7 @@
       threadState.categoryId = data.category_id || null;
       threadState.postsCount = data.posts_count || posts.length;
       threadState.views = data.views || 0;
+      updateTopicSolutions(data, true);
 
       for (const p of posts) {
         if (p.post_number) threadState.postsByNum[p.post_number] = p;
@@ -8405,6 +8986,7 @@
       }
       syncAppChrome({ title: threadState.title });
       renderCodePanel();
+      syncComposerContext();
       if (!categoriesCache && threadState.categoryId) {
         loadCategories().then(() => {
           if (req.isCurrent() && isThemeActive()) {
@@ -8438,8 +9020,9 @@
         threadState.loading = false;
       }
     }
-    if (targetPost && req.isCurrent() && isThemeActive() && pageRequestKey() === ownerPage && topicCoordinator.status === "ready") {
-      await jumpToSource(Number(targetPost));
+    if (resumePost && req.isCurrent() && isThemeActive() && pageRequestKey() === ownerPage && topicCoordinator.status === "ready") {
+      await jumpToSource(resumePost, {automatic:!targetPost, offset:!targetPost ? savedPosition?.offset : undefined,
+        allowed:() => threadScrollIntent === scrollIntent});
     }
   }
 
@@ -8682,20 +9265,12 @@
       syncSearchView();
     } else if (isTopic) {
       showView("detail");
-      // 进帖子：保留当前列表，仅详情区加载（列表为空则后台补一份 latest 供 rail 分组用）
-      if (listState.topics.length && listState.apiPath) {
-        renderListRows();
-      } else {
-        loadList(listState.apiPath || "/latest.json", false);
-      }
+      // The hidden source list belongs to its own route, not the topic request.
       loadTopic(topicIdFromPath(pathname));
     } else {
       showView("list");
       // 路由换了列表类型 → 重置缓存键强制重拉
-      const apiPath = listApiForPath(pathname);
-      if (listState.apiPath && listState.apiPath !== apiPath && listState.path !== pathname) {
-        listState.topics = [];
-      }
+      const apiPath = listApiForPath(pathname + location.search);
       loadList(apiPath, false);
     }
     syncChrome();
@@ -8807,6 +9382,15 @@
       const original = history[method];
       history[method] = function (...args) {
         const previousPath = location.pathname;
+        const target = new URL(args[2] == null ? location.href : args[2], location.href);
+        if (isThemeActive() && target.origin === location.origin && isTopicPath(target.pathname) &&
+            (args[0] == null || (typeof args[0] === "object" && !Array.isArray(args[0])))) {
+          // A history entry owns its source list. Returning via another category
+          // must not replace that origin; retain the native router's state too.
+          args[0] = { ...args[0], codexListOrigin: isHomePath(previousPath)
+            ? location.pathname + location.search + location.hash
+            : isTopicPath(previousPath) ? topicListOrigin : "" };
+        }
         const result = original.apply(this, args);
         // pushState and back/forward are explicit navigation; same-topic
         // replaceState is commonly just Discourse updating its reading marker.
@@ -8816,6 +9400,8 @@
       };
     }
     window.addEventListener("popstate", () => {
+      restoreTopicEntry = isTopicPath(location.pathname);
+      listRestoreKey = isHomePath(location.pathname) ? pageRequestKey() : "";
       invalidatePageRequests(true);
       scheduleApply();
     });

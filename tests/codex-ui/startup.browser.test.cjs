@@ -133,7 +133,8 @@ test(`startup: stale append (${oldStatus}) cannot change a new page or release i
 test("startup: explicit same-page refresh replaces pending list and invalidates old append", async t => {
   const page = await openFixture(t);
   await waitRequest(page, "/new.json");
-  await page.locator('.cx-new-toggle-btn[data-mod="topics"]').click();
+  // Clicking the already-selected subset refreshes; a different subset now changes the API query.
+  await page.locator('.cx-new-toggle-btn[data-mod="all"]').click();
   await waitRequest(page, "/new.json", 2);
   assert.equal(await page.evaluate(() => __harness.requests.find(r => r.url === "/new.json").aborted), true);
   await reply(page, "/new.json", list("Forced list", 2, "/new.json?page=1"));

@@ -27,10 +27,10 @@ test("presentation: replies have stable, keyboard accessible activity outside or
   assert.equal(await page.locator(".cx-cooked [data-codex-decorative], .cx-turn-user .cx-turn-activity").count(), 0);
   const original = await turn.locator(".cx-cooked").innerHTML();
   const activity = await turn.locator(".cx-turn-activity").innerText();
-  assert.equal(new Set(await page.locator(".cx-think summary").allTextContents()).size, 3, "different replies receive varied timings");
+  assert.equal(new Set(await page.locator(".cx-think > summary").allTextContents()).size, 3, "different replies receive varied timings");
   const thinking = turn.locator("details.cx-think");
   assert.equal(await thinking.getAttribute("open"), null);
-  await thinking.locator("summary").focus();
+  await thinking.locator(":scope > summary").focus();
   await page.keyboard.press("Enter");
   assert.equal(await thinking.evaluate(el => el.open), true);
   const tools = turn.locator("details.cx-tools");
@@ -54,8 +54,8 @@ test("presentation: replies have stable, keyboard accessible activity outside or
   assert.equal(await tools.evaluate(el => el.open), true);
   assert.equal(await command.evaluate(el => el.open), true, "individual command disclosure survives rerender");
   assert.equal(await turn.locator(".cx-cooked").innerHTML(), original);
-  await thinking.locator("summary").click();
   await tools.locator(":scope > summary").click();
+  await thinking.locator(":scope > summary").click();
   assert.equal(await turn.locator(".cx-turn-activity").innerText(), activity);
   assert.equal(await page.locator(".cx-turn-activity").count(), 3);
 });
@@ -63,9 +63,10 @@ test("presentation: replies have stable, keyboard accessible activity outside or
 test("presentation: activity follows compact Codex rows and truncates long commands without losing output", async t => {
   const page = await openThread(t, { width: 390 });
   const tools = page.locator(".cx-tools").first();
+  await page.locator('.cx-think > summary').first().click();
   const summary = tools.locator(":scope > summary");
   assert.match(await summary.innerText(), /运行了命令|已使用 Codey Fastctx 集成/);
-  assert.match(await page.locator(".cx-think > summary").first().innerText(), /^用时 \d+秒$/);
+  assert.match(await page.locator(".cx-think > summary").first().innerText(), /^已处理 \d+ 秒$/);
   const icon = await summary.locator(".cx-activity-icon").boundingBox();
   const text = await summary.locator(".cx-activity-label").boundingBox();
   const chevron = await summary.locator(".cx-activity-chevron").boundingBox();
@@ -110,6 +111,7 @@ test("presentation: site disclosure styles cannot add leading triangles or stack
       html body details > summary > span { display: block; }
     ` });
     const turn = page.locator('.cx-turn-agent[data-post-number="2"]');
+    await turn.locator('.cx-think > summary').click();
     const tools = turn.locator('.cx-tools > summary');
     await tools.click();
     const rows = [tools, turn.locator('.cx-think > summary'), turn.locator('.cx-runline > summary').first(),
@@ -166,6 +168,7 @@ test("presentation: activity visibility alone never reports a post as read", asy
   await hasText(page, ".cx-thread-posts", "第 2 条原始回复");
   await page.setViewportSize({ width: 900, height: 480 });
   const turn = page.locator('.cx-turn-agent[data-post-number="2"]');
+  await turn.locator(".cx-think > summary").click();
   await turn.locator(".cx-tools > summary").click();
   for (const summary of await turn.locator(".cx-runline > summary").all()) await summary.click();
   await turn.evaluate(el => {
@@ -238,6 +241,7 @@ test("presentation: thread and expanded composer fit dark/light desktop and mobi
       fs.mkdirSync(process.env.CODEX_SCREENSHOT_DIR, { recursive: true });
       await page.screenshot({ path: path.join(process.env.CODEX_SCREENSHOT_DIR, `thread-${mode}-${width}.png`) });
       if (width === 1600 || width === 390) {
+        await page.locator(".cx-think > summary").first().click();
         await page.locator(".cx-tools > summary").first().click();
         await page.screenshot({ path: path.join(process.env.CODEX_SCREENSHOT_DIR, `thread-tools-${mode}-${width}.png`) });
         await page.locator(".cx-runline > summary").first().click();

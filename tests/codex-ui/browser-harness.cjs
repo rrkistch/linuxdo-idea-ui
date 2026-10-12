@@ -49,21 +49,22 @@ function installHarness(options) {
   // guards independently of transport cancellation (including stale finally blocks).
   window.fetch = (input, init = {}) => {
     const url = new URL(String(input), location.href);
-    const entry = { url: url.pathname + url.search, method: init.method || "GET", body: init.body, aborted: false, done: false };
+    const entry = { url: url.pathname + url.search, method: init.method || "GET", body: init.body,
+      headers: Object.fromEntries(new Headers(init.headers)), credentials: init.credentials, aborted: false, done: false };
     h.requests.push(entry);
     return new Promise((resolve, reject) => {
-      entry.reply = (data, status = 200) => {
+      entry.reply = (data, status = 200, headers = {}) => {
         entry.done = true;
-        resolve(new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } }));
+        resolve(new Response(typeof data === "string" ? data : JSON.stringify(data), { status, headers: { "Content-Type": "application/json", ...headers } }));
       };
       init.signal?.addEventListener("abort", () => {
         entry.aborted = true;
         if (options.honorAbort) { entry.done = true; reject(new DOMException("Aborted", "AbortError")); }
       }, { once: true });
-      if (entry.url === "/categories.json") entry.reply({ category_list: { categories: [] } });
+      if (entry.url === "/categories.json") entry.reply({ category_list: { categories: options.categories || [] } });
       // Existing rail recents request is independent of the main list coordinator.
-      if (entry.url === "/latest.json" && !init.signal) entry.reply({ topic_list: { topics: [] } });
-      if (entry.method !== "GET") entry.reply(options.mockWrites?.[entry.url] || {});
+      if (entry.url === "/latest.json" && (!init.signal || entry.headers['discourse-background'] === 'true')) entry.reply({ topic_list: { topics: [] } });
+      if (entry.method !== "GET" && !options.manualWrites?.includes(entry.url)) entry.reply(options.mockWrites?.[entry.url] || {});
     });
   };
 }
@@ -71,6 +72,7 @@ function installHarness(options) {
 async function openFixture(t, options = {}) {
   const context = await browser.newContext({ serviceWorkers: "block" });
   const page = await context.newPage();
+  if (options.clock) await page.clock.install();
   if (options.width) await page.setViewportSize({ width: options.width, height: 1000 });
   page.setDefaultTimeout(1800);
   const errors = [];
@@ -79,7 +81,7 @@ async function openFixture(t, options = {}) {
   // No real site, account, CDN, or API is contacted, including unmocked resources.
   await context.route("**/*", route => {
     if (route.request().isNavigationRequest()) {
-      return route.fulfill({ contentType: "text/html", body: `<!doctype html><html class="${options.rootClass || ""}"><head><title>${options.challenge ? "Just a moment..." : "Linux DO fixture"}</title><link rel="icon" href="/favicon.ico"></head><body><aside class="sidebar-wrapper">Native sidebar</aside><div id="main-outlet-wrapper"><div id="main-outlet"><div class="community-banner">Community banner</div>Native content</div></div>${options.challenge ? '<form id="challenge-form"></form>' : ""}</body></html>` });
+      return route.fulfill({ contentType: "text/html", body: `<!doctype html><html class="${options.rootClass || ""}"><head><title>${options.challenge ? "Just a moment..." : "Linux DO fixture"}</title><link rel="icon" href="/favicon.ico"></head><body>${options.username ? `<div id="current-user"><a href="/u/${options.username}">${options.username}</a></div>` : ""}<aside class="sidebar-wrapper">Native sidebar</aside><div id="main-outlet-wrapper"><div id="main-outlet"><div class="community-banner">Community banner</div>Native content</div></div>${options.challenge ? '<form id="challenge-form"></form>' : ""}</body></html>` });
     }
     network.push(route.request().url());
     return route.fulfill({ status: 200, body: "" });
@@ -100,14 +102,14 @@ const list = (title, id = 1, more = null) => ({ topic_list: { topics: title ? [{
 const topic = (title, id = 42) => ({ id, title, slug: `topic-${id}`, posts_count: 1, post_stream: { stream: [id * 10], posts: [{ id: id * 10, post_number: 1, username: "fixture", cooked: `<p>${title} body</p>` }] } });
 async function requestCount(page, url) { return page.evaluate(url => __harness.requests.filter(r => r.url === url).length, url); }
 async function waitRequest(page, url, count = 1) { await page.waitForFunction(({ url, count }) => __harness.requests.filter(r => r.url === url).length >= count, { url, count }); }
-async function reply(page, url, data, status = 200, index = -1) {
+async function reply(page, url, data, status = 200, index = -1, headers = {}) {
   await page.waitForFunction(({ url, index }) => !!__harness.requests.filter(r => r.url === url && !r.done).at(index), { url, index });
-  await page.evaluate(({ url, data, status, index }) => {
+  await page.evaluate(({ url, data, status, index, headers }) => {
     const matches = __harness.requests.filter(r => r.url === url && !r.done);
     const entry = matches.at(index);
     if (!entry) throw new Error(`No pending mock for ${url}`);
-    entry.reply(data, status);
-  }, { url, data, status, index });
+    entry.reply(data, status, headers);
+  }, { url, data, status, index, headers });
 }
 async function hasText(page, selector, text) {
   await page.waitForFunction(({ selector, text }) => document.querySelector(selector)?.textContent.includes(text), { selector, text });

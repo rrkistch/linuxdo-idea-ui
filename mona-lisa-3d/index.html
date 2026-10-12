@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>名画《蒙娜丽莎》图层分层 3D 拆解与笔触堆叠解析系统</title>
+    <meta name="description" content="基于卢浮宫 C2RMF 科学检测与达·芬奇手稿，真实还原《蒙娜丽莎》从白杨木板、石膏打底、木炭起草、明暗雕塑到30层微米级晕涂罩染与岁月清漆的 3D 立体爆炸拆解与笔触显微分析。">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app-container">
+        <!-- 3D WebGL 视口画布容器 -->
+        <div id="canvas-container"></div>
+
+        <!-- 博物馆柔焦氛围光效 -->
+        <div class="vignette-overlay"></div>
+
+        <!-- 顶部导航栏 Header -->
+        <header class="app-header">
+            <div class="brand-group">
+                <div class="brand-logo">ᛚ</div>
+                <div class="brand-titles">
+                    <h1>
+                        《蒙娜丽莎》图层分层 3D 拆解与笔触堆叠解析
+                        <span class="badge">卢浮宫 C2RMF 科学检测级</span>
+                    </h1>
+                    <p>Leonardo da Vinci · La Gioconda · 1503–1517 · 白杨木板油彩 · 微米级 Sfumato 晕涂工程解析</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button class="btn-header" id="reset-cam-btn" title="复位 3D 观察视角">
+                    <span>↺</span>
+                    <span>复位视角</span>
+                </button>
+                <button class="btn-header" id="fullscreen-btn" title="全屏沉浸式探索">
+                    <span>⛶</span>
+                    <span>全屏模式</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- 悬浮主操作界面 (Left HUD & Right HUD) -->
+        <main class="main-ui-overlay">
+            <!-- 左侧：图层立体拆解与工序控制台 -->
+            <section class="panel-left">
+                <!-- 3D 空间爆炸拉伸控制器 -->
+                <div class="glass-panel explosion-control-box">
+                    <div class="panel-title-bar">
+                        <h2>
+                            <span>✦</span>
+                            <span>3D 空间抽屉式炸开</span>
+                        </h2>
+                        <span class="panel-badge">Z轴空间分离</span>
+                    </div>
+                    <div class="slider-row">
+                        <span>拉伸距离 (Explosion)</span>
+                        <span class="val" id="explosion-val">55%</span>
+                    </div>
+                    <input type="range" id="explosion-slider" class="custom-range" min="0" max="100" value="55">
+                    <div class="explosion-quick-btns">
+                        <button class="quick-btn" data-pct="0">合拢 0%</button>
+                        <button class="quick-btn" data-pct="50">适中 50%</button>
+                        <button class="quick-btn" data-pct="100">完全 100%</button>
+                    </div>
+                </div>
+
+                <!-- 8 大物理/技法图层卡片列表 -->
+                <div class="glass-panel" style="flex: 1; display: flex; flex-direction: column;">
+                    <div class="panel-title-bar">
+                        <h2>
+                            <span>☰</span>
+                            <span>达·芬奇工艺 8 大图层</span>
+                        </h2>
+                        <span class="panel-badge">从基底到清漆</span>
+                    </div>
+                    <div class="layers-list" id="layers-list-container">
+                        <!-- 由 app.js 动态渲染 -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- 右侧：多光谱科学检测与显微切片剖面 -->
+            <section class="panel-right">
+                <!-- 多光谱实验室选择 -->
+                <div class="glass-panel">
+                    <div class="panel-title-bar">
+                        <h2>
+                            <span>🔬</span>
+                            <span>多光谱科学检测实验室</span>
+                        </h2>
+                        <span class="panel-badge">物理穿透</span>
+                    </div>
+                    <div class="spectral-grid" id="spectral-grid-container">
+                        <!-- 由 app.js 动态渲染 -->
+                    </div>
+                </div>
+
+                <!-- 显微横切面切片镜 (Paint Cross-Section) -->
+                <div class="glass-panel microscope-container">
+                    <div class="panel-title-bar">
+                        <h2>
+                            <span>📏</span>
+                            <span>显微横切面切片剖面 (0~250μm)</span>
+                        </h2>
+                        <span class="panel-badge">显微物相</span>
+                    </div>
+                    <div class="micro-canvas-wrapper">
+                        <canvas id="cross-section-canvas"></canvas>
+                        <div class="microscope-reticle" style="left: 30%;"></div>
+                    </div>
+                    <div class="microscope-info-box">
+                        <span class="micro-layer-name">滑动鼠标检测油画各微观截面...</span>
+                        <span class="micro-layer-desc">移动至上方切片以探测特定深度之颜料矿物颗粒形态与结合剂分子。</span>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- 居中悬浮相机视角导航 Floating Presets -->
+        <nav class="camera-floating-bar">
+            <button class="cam-btn" data-preset="front">
+                <span>◻</span>
+                <span>2D 正面</span>
+            </button>
+            <button class="cam-btn active" data-preset="iso">
+                <span>⬡</span>
+                <span>3D 轴测</span>
+            </button>
+            <button class="cam-btn" data-preset="side">
+                <span>▤</span>
+                <span>侧切厚度</span>
+            </button>
+            <button class="cam-btn" data-preset="macro">
+                <span>🔍</span>
+                <span>面部微距</span>
+            </button>
+        </nav>
+
+        <!-- 创作工序导览 HUD 卡片 -->
+        <div class="tour-hud-box" id="tour-hud-box">
+            <div class="tour-hud-header">
+                <span class="tour-step-badge" id="tour-step-badge">工序阶段 1 / 6</span>
+                <button class="layer-action-btn" id="tour-close-btn">✕</button>
+            </div>
+            <h3 class="tour-hud-title" id="tour-hud-title">工序标题</h3>
+            <p class="tour-hud-desc" id="tour-hud-desc">工序详细技法说明...</p>
+            <div class="tour-hud-footer">
+                <button class="tour-nav-btn" id="tour-prev-btn">◀ 上一步</button>
+                <button class="tour-nav-btn primary" id="tour-next-btn">下一步 ▶</button>
+            </div>
+        </div>
+
+        <!-- 底部关键笔触与导览栏 Footer -->
+        <footer class="app-footer-bar">
+            <div class="hotspots-pill-group" id="hotspots-pill-container">
+                <!-- 由 app.js 动态渲染关键笔触锚点 -->
+            </div>
+            <button class="tour-btn" id="start-tour-btn">
+                <span>▶</span>
+                <span>达·芬奇创作工序全景导览</span>
+            </button>
+        </footer>
+
+        <!-- 笔触细节深度解析弹窗 Modal -->
+        <div class="modal-overlay" id="hotspot-modal-overlay">
+            <div class="modal-box">
+                <div class="modal-header">
+                    <div class="modal-header-titles">
+                        <h2 id="modal-title">笔触深度解析</h2>
+                        <p id="modal-subtitle">解剖构造与微观物理</p>
+                    </div>
+                    <button class="modal-close-btn" id="modal-close-btn" title="关闭">✕</button>
+                </div>
+                <div class="modal-body">
+                    <!-- 核心科研参数量化卡片 -->
+                    <div class="detail-metrics-grid" id="modal-metrics-box">
+                        <!-- 由 app.js 动态注入 -->
+                    </div>
+
+                    <!-- 达芬奇历史手稿注记引文 -->
+                    <div class="da-vinci-quote" id="modal-quote">
+                        “让你的阴影与高光如烟雾般交融，没有明显的界线或轮廓……”
+                    </div>
+
+                    <!-- 深度学术解析正文 -->
+                    <div class="analysis-box">
+                        <div class="modal-section-title">
+                            <span>◈</span>
+                            <span>运笔技法、解剖原理与光学堆叠机制</span>
+                        </div>
+                        <div class="analysis-prose" id="modal-analysis-content">
+                            <!-- 动态注入学术分析 -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 依赖脚本 -->
+    <script src="vendor/three.min.js"></script>
+    <script src="vendor/OrbitControls.js"></script>
+    <script src="data.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

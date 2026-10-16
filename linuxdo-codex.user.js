@@ -445,6 +445,7 @@
     topicCoordinator.cancel();
     topicRefreshCoordinator.cancel();
     searchCoordinator.cancel();
+    pendingThreadUpdate = null;
     clearReplyBranches();
     searchState.routeKey = null;
     searchState.loading = false;
@@ -488,6 +489,7 @@
     topicCoordinator.cancel();
     topicRefreshCoordinator.cancel();
     searchCoordinator.cancel();
+    pendingThreadUpdate = null;
     clearReplyBranches();
     searchState.routeKey = null;
     searchState.loading = false;
@@ -1573,14 +1575,20 @@
     }
   }
   /** 发送后的刷新只合并楼层和更新分页信息，不替换已读窗口或追到页尾。 */
-  async function refreshAfterReply() {
+  async function refreshAfterReply(providedData = null) {
     const topicId = threadState.topicId;
     if (!topicId || !isThemeActive()) return;
     const ownerVersion = topicCoordinator.currentRequestId;
     const req = topicRefreshCoordinator.begin(`topic-refresh:${topicId}`);
     try {
-      const data = await api(`/t/${topicId}.json`, undefined, req.signal);
+      const data = providedData || await api(`/t/${topicId}.json`, undefined, req.signal);
       if (!req.isCurrent() || !topicCoordinator.isCurrent(ownerVersion) || threadState.topicId !== topicId || !isThemeActive()) return;
+      if (threaded() && !applyingThreadUpdate) {
+        pendingThreadUpdate = data;
+        const bar = document.querySelector('.cx-reading-mode [data-thread-updates]');
+        if(bar)bar.hidden=false;
+        return;
+      }
       updateTopicSolutions(data, true);
       const posts = (data.post_stream && data.post_stream.posts) || [];
       const firstId = threadState.stream[threadState.renderedFirstIdx];
@@ -1595,7 +1603,7 @@
       const box = detailContainer();
       if (box) preserveThreadViewport(() => {
         mergeThreadPosts(box, posts);
-        const renderedIds = new Set([...box.querySelectorAll(":scope > [data-post-number]")]
+        const renderedIds = new Set(mainTurns(box)
           .map(el => threadState.postsByNum[el.dataset.postNumber]?.id).filter(Number.isFinite));
         // Extend only through rendered neighbours; a remote jump may leave gaps.
         while (threadState.renderedFirstIdx > 0 && renderedIds.has(threadState.stream[threadState.renderedFirstIdx - 1])) threadState.renderedFirstIdx--;
@@ -3647,6 +3655,20 @@
     .cx-boost-chip details { min-width:0; max-width:100%; }
     .cx-boost-chip summary { cursor:pointer; overflow-wrap:anywhere; }
     .cx-boost-full { margin:6px 0 2px; white-space:pre-wrap; }
+    .cx-reading-mode { display:flex; gap:12px; padding:7px 20px; border-bottom:1px solid var(--cx-border-soft); flex:none; }
+    .cx-reading-mode[hidden] { display:none; }
+    .cx-reading-mode button, .cx-thread-pages button, .cx-thread-relation { font:inherit; font-size:12px; border:0; background:transparent; color:var(--cx-text-dim); cursor:pointer; padding:4px; }
+    .cx-reading-mode button[aria-pressed="true"] { color:var(--cx-text); border-bottom:2px solid var(--cx-blue); }
+    .cx-reading-mode button[hidden] { display:none; }
+    .cx-thread-pages { display:flex; align-items:center; flex-wrap:wrap; gap:10px; justify-content:space-between; padding:16px 0; font-size:12px; color:var(--cx-text-dim); }
+    .cx-thread-pages [hidden] { display:none; }
+    .cx-threaded .cx-post-unit { min-width:0; margin-bottom:14px; }
+    .cx-threaded .cx-post-unit:not([data-depth="0"]) { margin-left:calc(var(--cx-indent,20px) * var(--cx-depth,1)); border-left:1px solid var(--cx-border-strong); padding:8px 12px; background:var(--cx-bg-raised); border-radius:6px; }
+    .cx-threaded [data-depth="2"] { --cx-depth:2; }
+    .cx-threaded [data-depth="3"] { --cx-depth:3; }
+    .cx-threaded .cx-branch-slot, .cx-threaded .cx-parent-slot { display:none; }
+    .cx-thread-relation { display:block; text-align:left; }
+    @media(max-width:600px) { .cx-threaded { --cx-indent:12px; } .cx-reading-mode {gap:8px;padding:6px 12px;} }
     /* Desktop shell: functional app strip, quiet surfaces and aligned reading/composer columns. */
     .codex-rail { padding-left:48px; box-sizing:border-box; border-right:1px solid var(--cx-border-soft); }
     .codex-app-strip { position:absolute; inset:0 auto 0 0; width:48px; display:flex; flex-direction:column; align-items:center; gap:10px; padding:14px 0; box-sizing:border-box; background:var(--cx-bg-inset); border-right:1px solid var(--cx-border-soft); }
@@ -5352,8 +5374,9 @@
     });
     main.querySelector(".cx-view-detail").addEventListener("scroll", (e) => {
       const el = e.target;
-      if (el.scrollTop < 80) loadOlderPosts();
-      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 120) loadNewerPosts();
+      if (!threaded() && el.scrollTop < 80) loadOlderPosts();
+      if (threaded()) autoLoadThreadReplies(el);
+      else if (el.scrollTop + el.clientHeight >= el.scrollHeight - 120) loadNewerPosts();
     });
     const detail = main.querySelector(".cx-view-detail");
     for (const type of ["wheel", "touchmove", "pointerdown"]) detail.addEventListener(type, () => { threadScrollIntent++; }, {passive:true});
@@ -5643,6 +5666,8 @@
     if (detail) detail.style.display = view === "detail" ? "" : "none";
     main.querySelector(".cx-view-search").style.display = view === "search" ? "" : "none";
     main.querySelector(".codex-composer-wrap").style.display = view === "search" ? "none" : "";
+    const readingBar = main.querySelector(".cx-reading-mode");
+    if (readingBar) readingBar.hidden = view !== "detail";
     if (view === "search") cxClosePop();
     syncComposerContext();
   }
@@ -6224,6 +6249,7 @@
     const curReqId = topicCoordinator.currentRequestId;
     const requestedScrollTop = scroller.scrollTop;
     threadState.loading = true;
+    syncThreadPagingState();
     try {
       const data = await api(`/t/${targetTopicId}/${n}.json`, undefined, topicCoordinator.controller?.signal);
       if (!topicCoordinator.isCurrent(curReqId) || threadState.topicId !== targetTopicId || !isThemeActive()) return;
@@ -6268,6 +6294,7 @@
     } finally {
       if (topicCoordinator.isCurrent(curReqId)) {
         threadState.loading = false;
+        syncThreadPagingState();
       }
     }
   }
@@ -8308,6 +8335,7 @@
     renderedLastIdx: -1,   // stream 中已渲染的结束下标
     hasOlder: false,
     hasNewer: false,
+    newerError: "",
     title: "",
     slug: "",
     categoryId: null,
@@ -8412,6 +8440,7 @@
     if (!box) return;
     syncReplyParents(box);
     syncPostBoosts(box);
+    if (threaded()) return;
     for (const slot of box.querySelectorAll(".cx-branch-slot")) {
       const post = threadState.postsByNum[slot.dataset.branchParent];
       const state = replyBranchState(post);
@@ -8650,6 +8679,7 @@
     if (!thinking && !tools) return;
     holder.querySelectorAll(".cx-turn-agent > .cx-cooked").forEach((cooked) => {
       const turn = cooked.parentElement;
+      if (threaded() && Number(turn.closest('.cx-post-unit')?.dataset.depth) > 0) return;
       if (turn.dataset.ownReply === "1" || turn.querySelector(".cx-turn-activity")) return;
       const activity = activityForPost(turn);
       const wrapper = document.createElement("div");
@@ -8709,7 +8739,7 @@
     if (!box) return;
     const answers = threadState.acceptedAnswers || [];
     const accepted = new Set(answers.map(answer => answer.post_number));
-    for (const turn of box.querySelectorAll(":scope > [data-post-number]")) {
+    for (const turn of mainTurns(box)) {
       const meta = turn.nextElementSibling;
       if (!meta?.matches(".cx-worked, .cx-turn-meta")) continue;
       const badge = meta.querySelector(".cx-solution-badge");
@@ -8721,7 +8751,7 @@
         }
       } else badge?.remove();
     }
-    let panel = box.querySelector(":scope > .cx-solutions");
+    let panel = box.querySelector(".cx-solutions");
     if (!threadState.solved) { panel?.remove(); return; }
     if (!panel) {
       panel = document.createElement("section");
@@ -8729,7 +8759,7 @@
       panel.setAttribute("aria-label", "已采纳的解决方案");
     }
     panel.dataset.topicId = String(threadState.topicId);
-    const first = box.querySelector(':scope > .cx-turn-user[data-post-number="1"]');
+    const first = box.querySelector('.cx-turn-user[data-post-number="1"]');
     const anchor = first?.nextElementSibling?.matches(".cx-turn-meta") ? first.nextElementSibling : first;
     if (anchor) { if (anchor.nextElementSibling !== panel) anchor.after(panel); }
     else if (box.firstElementChild !== panel) box.prepend(panel);
@@ -8810,6 +8840,173 @@
       </div>`;
   }
 
+  const READING_MODE_KEY = "linuxdo-codex-reading-mode";
+  let readingMode = "chronological";
+  try { if (localStorage.getItem(READING_MODE_KEY) === "thread") readingMode = "thread"; } catch {}
+  let pendingThreadUpdate = null;
+  let applyingThreadUpdate = false;
+  let threadPagingTop = 0;
+  let threadFillFrame = null;
+  const threaded = () => readingMode === "thread";
+  const mainTurns = box => [...box.querySelectorAll(":scope > [data-post-number], :scope > .cx-post-unit > [data-post-number]")];
+
+  function flattenPostUnits(box) {
+    for (const unit of box.querySelectorAll(":scope > .cx-post-unit")) unit.replaceWith(...unit.childNodes);
+  }
+  function threadAnchor(box) {
+    const scroller = box?.closest(".cx-view-detail");
+    if (!scroller) return null;
+    const top = scroller.getBoundingClientRect().top;
+    const turn = mainTurns(box).map(el=>el.querySelector(':scope > .cx-cooked, :scope > .cx-turn-user-bubble') || el).find(el => el.getBoundingClientRect().bottom > top);
+    return turn ? {turn, top:turn.getBoundingClientRect().top, scroller} : null;
+  }
+  function keepThreadAnchor(anchor) {
+    if (anchor?.turn.isConnected) anchor.scroller.scrollTop += anchor.turn.getBoundingClientRect().top - anchor.top;
+  }
+  // Loading finishes after the tree is rendered. Refresh only control state,
+  // not the tree/viewport, so persisted-mode startup cannot leave paging disabled.
+  function autoLoadThreadReplies(scroller) {
+    const previousTop = threadPagingTop;
+    threadPagingTop = scroller.scrollTop;
+    if (!threaded() || !isThemeActive() || !isTopicPath(location.pathname) ||
+        topicIdFromPath(location.pathname) !== threadState.topicId || topicCoordinator.status !== "ready" ||
+        threadState.loading || threadState.newerError || !threadState.hasNewer) return;
+    // Reordering/anchor compensation records its position before scroll delivery.
+    // Only subsequent downward movement starts the next page.
+    if (scroller.scrollTop > previousTop && scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <= 320) {
+      loadNewerPosts(true);
+    }
+  }
+  function syncThreadPagingState() {
+    if (!isThemeActive() || topicIdFromPath(location.pathname) !== threadState.topicId) return;
+    const box = detailContainer();
+    const pages = box?.querySelector(":scope > .cx-thread-pages");
+    if (!pages) return;
+    const scroller = box.closest(".cx-view-detail");
+    threadPagingTop = scroller.scrollTop;
+    pages.setAttribute("aria-busy", String(threadState.loading));
+    for (const button of pages.querySelectorAll("button[data-page-label]")) {
+      button.disabled = threadState.loading;
+      button.textContent = threadState.loading ? "正在加载楼层…" : button.dataset.pageLabel;
+    }
+    const status = pages.querySelector("[data-thread-page-status]");
+    if (status) {
+      status.textContent = threadState.loading ? "正在加载更多回复…" : threadState.newerError
+        ? `后续回复加载失败（${threadState.newerError}）` : threadState.hasNewer
+          ? "继续下滑，自动加载更多回复" : threadState.hasOlder ? "已加载到最后一楼" : "已加载全部回复";
+    }
+    const retry = pages.querySelector("[data-thread-page-retry]");
+    if (retry) { retry.hidden = !threadState.newerError; retry.disabled = threadState.loading; }
+    // Short first pages must fill the viewport, but never prefetch the whole topic.
+    if (threaded() && !threadState.loading && !threadState.newerError && threadState.hasNewer && threadFillFrame === null) {
+      const version = topicCoordinator.currentRequestId;
+      threadFillFrame = requestAnimationFrame(() => {
+        threadFillFrame = null;
+        if (topicCoordinator.isCurrent(version) && isThemeActive() && threaded() && box.isConnected &&
+            isTopicPath(location.pathname) && topicIdFromPath(location.pathname) === threadState.topicId &&
+            !threadState.loading && !threadState.newerError && scroller.scrollHeight <= scroller.clientHeight + 1) loadNewerPosts(true);
+      });
+    }
+  }
+  function syncReadingMode() {
+    const box = detailContainer();
+    if (!box || !isTopicPath(location.pathname)) return;
+    const scroller = box.closest(".cx-view-detail");
+    let bar = scroller.parentElement.querySelector(".cx-reading-mode");
+    if (!bar) {
+      bar = document.createElement("div"); bar.className = "cx-reading-mode";
+      bar.setAttribute("role", "group"); bar.setAttribute("aria-label", "评论阅读方式");
+      bar.innerHTML = '<button type="button" data-reading-mode="chronological">楼层顺序</button><button type="button" data-reading-mode="thread">楼中楼</button><button type="button" data-thread-updates hidden>有新回复 · 查看</button>';
+      scroller.before(bar);
+      bar.addEventListener("click", e => {
+        const mode = e.target.closest("[data-reading-mode]")?.dataset.readingMode;
+        if (mode) {
+          const anchor = threadAnchor(box);
+          readingMode = mode;
+          try { localStorage.setItem(READING_MODE_KEY, mode); } catch {}
+          syncThreadDivider(); keepThreadAnchor(anchor);
+          if (!threaded() && pendingThreadUpdate) applyPendingThreadUpdate();
+        } else if (e.target.closest("[data-thread-updates]")) applyPendingThreadUpdate();
+      });
+    }
+    bar.hidden = false;
+    bar.querySelectorAll("[data-reading-mode]").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.readingMode === readingMode)));
+    bar.querySelector("[data-thread-updates]").hidden = !pendingThreadUpdate;
+    box.classList.toggle("cx-threaded", threaded());
+    flattenPostUnits(box);
+    box.querySelectorAll(":scope > .cx-thread-relation").forEach(el=>el.remove());
+    const turns = mainTurns(box).sort((a,b) => Number(a.dataset.postNumber)-Number(b.dataset.postNumber));
+    const units = new Map();
+    for (const turn of turns) {
+      const number = Number(turn.dataset.postNumber);
+      const unit = document.createElement("section"); unit.className = "cx-post-unit"; unit.dataset.unitPost = String(number);
+      const nodes = [turn];
+      for (let next=turn.nextElementSibling; next && !next.matches('[data-post-number], .cx-turn-divider, .cx-thread-pages'); next=next.nextElementSibling) nodes.push(next);
+      nodes.forEach(node=>unit.appendChild(node)); units.set(number,unit);
+    }
+    const children = new Map(), depths = new Map();
+    for (const [number,unit] of units) {
+      const post = threadState.postsByNum[number];
+      const parent = Number(post?.reply_to_post_number);
+      const valid = Number.isSafeInteger(parent) && parent>1 && parent<number && (!post.topic_id || Number(post.topic_id)===threadState.topicId);
+      const attached = valid && units.has(parent);
+      const depth = attached ? (depths.get(parent)||0)+1 : 0;
+      if (threaded()) unit.querySelectorAll('.cx-branch-slot').forEach(slot=>slot.replaceChildren());
+      depths.set(number,depth); unit.dataset.depth=String(Math.min(depth,3));
+      const key = attached ? parent : 0;
+      if (!children.has(key)) children.set(key,[]); children.get(key).push(number);
+      let relation = unit.querySelector(':scope > .cx-thread-relation');
+      relation?.remove();
+      if (threaded() && valid) {
+        relation=document.createElement('button'); relation.type='button'; relation.className='cx-thread-relation';
+        const author=threadState.postsByNum[parent]?.username || post.reply_to_user?.username;
+        relation.textContent=attached ? '回复 '+(author ? '@'+author+' · ' : '')+'#'+parent : '上级 #'+parent+' 未加载 · 查看';
+        relation.onclick=()=>jumpToSource(parent);
+        unit.prepend(relation);
+      }
+      // Preserve existing disclosure nodes/state; decorative activity is rebuilt from its cache.
+      if (threaded() && depth>0) unit.querySelectorAll('.cx-turn-activity').forEach(el=>el.remove());
+      else sprinkleActivity(unit);
+    }
+    const ordered=[];
+    if(threaded()) {
+      const stack=[...(children.get(0)||[])].reverse();
+      while(stack.length) { const n=stack.pop(); ordered.push(n); const replies=children.get(n)||[]; for(let i=replies.length-1;i>=0;i--)stack.push(replies[i]); }
+    }
+    else ordered.push(...units.keys());
+    for(const n of ordered) {
+      const unit=units.get(n);
+      if(threaded())box.appendChild(unit);
+      else {unit.querySelector(':scope > .cx-thread-relation')?.remove();box.append(...unit.childNodes);}
+    }
+    box.querySelector('.cx-turn-divider')?.remove();
+    box.querySelector('.cx-thread-pages')?.remove();
+    if (threaded()) {
+      const pages = document.createElement("div"); pages.className = "cx-thread-pages";
+      if (threadState.hasOlder) {
+        const earlier = document.createElement("button"); earlier.type = "button";
+        earlier.dataset.pageLabel = "加载更早楼层"; earlier.textContent = earlier.dataset.pageLabel;
+        earlier.onclick = async () => {
+          earlier.disabled = true; await loadOlderPosts();
+          if (isThemeActive() && box.isConnected && isTopicPath(location.pathname)) preserveThreadViewport(() => syncThreadDivider());
+        };
+        pages.appendChild(earlier);
+      }
+      const status = document.createElement("span"); status.dataset.threadPageStatus = ""; status.setAttribute("role", "status");
+      const retry = document.createElement("button"); retry.type = "button"; retry.dataset.threadPageRetry = ""; retry.textContent = "重试加载";
+      retry.onclick = () => loadNewerPosts();
+      pages.append(status, retry); box.appendChild(pages);
+      syncThreadPagingState();
+    }
+  }
+
+  async function applyPendingThreadUpdate() {
+    const data = pendingThreadUpdate; pendingThreadUpdate=null;
+    if(!data)return;
+    applyingThreadUpdate=true;
+    try { await refreshAfterReply(data); } finally {applyingThreadUpdate=false;}
+  }
+
   function turnsHtml(posts) {
     return posts.map((p) => (p.post_number === 1 ? opTurnHtml(p) : agentTurnHtml(p)) +
       `<div class="cx-boost-slot" data-boost-post="${Number(p.post_number)}"></div>` +
@@ -8858,7 +9055,8 @@
 
   /** Merge pages without replacing existing turns or inserting duplicates. */
   function mergeThreadPosts(box, posts) {
-    const rendered = [...box.querySelectorAll(":scope > [data-post-number]")];
+    flattenPostUnits(box);
+    const rendered = mainTurns(box);
     const known = new Set(rendered.map(el => Number(el.dataset.postNumber)));
     for (const post of posts.slice().sort((a, b) => a.post_number - b.post_number)) {
       if (!post.post_number || known.has(post.post_number)) continue;
@@ -8879,6 +9077,8 @@
     if (!box) return;
     syncReplyBranches();
     syncTopicSolutions();
+    syncReadingMode();
+    if (threaded()) return;
     box.querySelector(".cx-turn-divider")?.remove();
     const total = Math.max(0, (threadState.postsCount || 0) - 1);
     const loaded = threadState.renderedLastIdx - threadState.renderedFirstIdx + 1;
@@ -8899,7 +9099,7 @@
     if (!scroller || scroller.style.display === "none" || topicCoordinator.status !== "ready" ||
         requestPage !== `topic:${threadState.topicId}` || !threadState.positionKey) return;
     const top = scroller.getBoundingClientRect().top;
-    const turn = [...scroller.querySelectorAll(".cx-thread-posts > [data-post-number]")]
+    const turn = [...scroller.querySelectorAll(".cx-thread-posts > [data-post-number], .cx-post-unit > [data-post-number]")]
       .find(el => el.getBoundingClientRect().bottom > top);
     if (!turn) return;
     topicPositions.delete(threadState.positionKey);
@@ -8920,6 +9120,7 @@
       return;
     }
 
+    pendingThreadUpdate = null;
     clearReplyBranches();
     topicRefreshCoordinator.cancel();
     const req = topicCoordinator.begin(reqKey);
@@ -8931,7 +9132,10 @@
     restoreTopicEntry = false;
     const scrollIntent = threadScrollIntent;
     let resumePost = Number(targetPost) || savedPosition?.number || 0;
+    threadState.newerError = "";
+    threadPagingTop = 0;
     threadState.loading = true;
+    syncThreadPagingState();
     threadState.postsByNum = {};
     clearQuoteJumpHistory();
     ensureMain();
@@ -9018,6 +9222,7 @@
     } finally {
       if (req.isCurrent()) {
         threadState.loading = false;
+        syncThreadPagingState();
       }
     }
     if (resumePost && req.isCurrent() && isThemeActive() && pageRequestKey() === ownerPage && topicCoordinator.status === "ready") {
@@ -9039,9 +9244,10 @@
     const ids = threadState.stream.slice(Math.max(0, threadState.renderedFirstIdx - 20), threadState.renderedFirstIdx);
     if (!ids.length) return;
     threadState.loading = true;
+    syncThreadPagingState();
     try {
       const qs = ids.map((id) => `post_ids[]=${id}`).join("&");
-      const data = await api(`/t/${targetTopicId}/posts.json?${qs}`);
+      const data = await api(`/t/${targetTopicId}/posts.json?${qs}`, undefined, topicCoordinator.controller?.signal);
       if (!topicCoordinator.isCurrent(curReqId) || threadState.topicId !== targetTopicId || !isThemeActive()) return;
       const posts = sortPostsByStream(
         (data.post_stream && data.post_stream.posts) || data.posts || [],
@@ -9055,16 +9261,20 @@
         if (box) mergeThreadPosts(box, posts);
         syncThreadDivider();
       });
-    } catch { /* 保留现状 */ } finally {
+    } catch (error) {
+      if (threaded() && topicCoordinator.isCurrent(curReqId) && error.name !== "AbortError") cxToast("楼层加载失败，请点击分页按钮重试", "error");
+    } finally {
       if (topicCoordinator.isCurrent(curReqId)) {
         threadState.loading = false;
+        syncThreadPagingState();
       }
     }
   }
 
   /** 向下滚动加载更新的楼层（长帖不能只留首屏一页） */
-  async function loadNewerPosts() {
-    if (!threadState.hasNewer || threadState.loading || !threadState.topicId) return;
+  async function loadNewerPosts(automatic = false) {
+    if (!isThemeActive() || topicIdFromPath(location.pathname) !== threadState.topicId ||
+        !threadState.hasNewer || threadState.loading || !threadState.topicId || (automatic && threadState.newerError)) return;
     const targetTopicId = threadState.topicId;
     const curReqId = topicCoordinator.currentRequestId;
     const start = threadState.renderedLastIdx + 1;
@@ -9077,26 +9287,37 @@
       threadState.hasNewer = false;
       return;
     }
+    threadState.newerError = "";
     threadState.loading = true;
+    syncThreadPagingState();
     try {
       const qs = ids.map((id) => `post_ids[]=${id}`).join("&");
-      const data = await api(`/t/${targetTopicId}/posts.json?${qs}`);
+      const data = await api(`/t/${targetTopicId}/posts.json?${qs}`, undefined, topicCoordinator.controller?.signal);
       if (!topicCoordinator.isCurrent(curReqId) || threadState.topicId !== targetTopicId || !isThemeActive()) return;
-      const posts = sortPostsByStream(
-        (data.post_stream && data.post_stream.posts) || data.posts || [],
-        ids
-      );
+      const incoming = data.post_stream?.posts || data.posts;
+      if (!Array.isArray(incoming) || !incoming.length) throw new Error("未收到有效楼层数据");
+      const posts = sortPostsByStream(incoming.filter(post => ids.includes(post.id) &&
+        (!post.topic_id || Number(post.topic_id) === targetTopicId)), ids);
+      if (!posts.length) throw new Error("未收到有效楼层数据");
       threadState.renderedLastIdx = start + ids.length - 1;
       threadState.hasNewer = threadState.renderedLastIdx < threadState.stream.length - 1;
       for (const p of posts) { if (p.post_number) threadState.postsByNum[p.post_number] = p; }
       const box = detailContainer();
+      const anchor = threaded() ? threadAnchor(box) : null;
       preserveThreadViewport(() => {
         if (box) mergeThreadPosts(box, posts);
         syncThreadDivider();
       });
-    } catch { /* 保留现状 */ } finally {
+      keepThreadAnchor(anchor);
+    } catch (error) {
+      if (topicCoordinator.isCurrent(curReqId) && error.name !== "AbortError") {
+        threadState.newerError = error.message || "网络请求失败";
+        if (threaded()) cxToast("后续回复加载失败，可点击重试", "error");
+      }
+    } finally {
       if (topicCoordinator.isCurrent(curReqId)) {
         threadState.loading = false;
+        syncThreadPagingState();
       }
     }
   }

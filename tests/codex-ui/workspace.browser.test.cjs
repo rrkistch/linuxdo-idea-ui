@@ -7,8 +7,7 @@ const results = (title, id = 1, more = false, postNumber = 1) => ({
   posts: [{ id: id * 10, topic: { id, title, slug: `topic-${id}` }, post_number: postNumber, username: "alice", blurb: '<b>Matched</b> <img src=x onerror="window.injected=true"> text' }],
   more_full_page_results: more,
 });
-const searchTerm = q => !q || /(?:^|\s)in:all-posts(?=\s|$)/i.test(q) ? q : `${q} in:all-posts`;
-const searchUrl = (q, page = 1) => `/search.json?q=${encodeURIComponent(searchTerm(q))}&page=${page}`;
+const searchUrl = (q, page = 1) => `/search.json?q=${encodeURIComponent(q)}&page=${page}`;
 async function submit(page, q) {
   await page.locator(".cx-search-input").fill(q);
   await page.locator(".cx-search-input").press("Enter");
@@ -80,12 +79,13 @@ test("workspace: native context URLs respect explicit skip and restore scope aft
 });
 
 test("workspace: nested topic data yields accurate per-post links and top-level pagination", async t => {
-  const page = await openFixture(t, { route: "/search?q=cache" });
+  const query = "cache in:all-posts";
+  const page = await openFixture(t, { route: `/search?q=${encodeURIComponent(query)}` });
   const first = results("Cache design", 42, true, 3);
   first.posts.push({ ...first.posts[0], id: 427, post_number: 7 });
-  await reply(page, searchUrl("cache"), first);
-  assert.equal(new URL(page.url()).searchParams.get("q"), "cache");
-  assert.equal(await page.locator(".cx-search-input").inputValue(), "cache");
+  await reply(page, searchUrl(query), first);
+  assert.equal(new URL(page.url()).searchParams.get("q"), query);
+  assert.equal(await page.locator(".cx-search-input").inputValue(), query);
   await hasText(page, ".cx-search-results", "Cache design");
   assert.equal(await page.locator('.cx-search-result[href="/t/topic-42/42/3"]').count(), 1);
   assert.equal(await page.locator('.cx-search-result[href="/t/topic-42/42/7"]').count(), 1);
@@ -93,7 +93,7 @@ test("workspace: nested topic data yields accurate per-post links and top-level 
   const second = results("Cache design", 42, false, 7);
   second.posts[0].id = 427;
   second.posts.push({ ...second.posts[0], id: 429, post_number: 9 });
-  await reply(page, searchUrl("cache", 2), second);
+  await reply(page, searchUrl(query, 2), second);
   await page.locator('.cx-search-result[href="/t/topic-42/42/9"]').waitFor();
   assert.equal(await page.locator(".cx-search-result").count(), 3);
   assert.equal(await page.locator(".cx-search-more").count(), 0);

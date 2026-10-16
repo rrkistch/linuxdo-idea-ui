@@ -2167,6 +2167,8 @@
     .cx-search-submit, .cx-search-status button { border:1px solid var(--cx-border-strong); border-radius:7px; padding:8px 15px; background:var(--cx-chip-bg); color:var(--cx-text); cursor:pointer; flex:none; }
     .cx-search-status button:disabled { opacity:.55; cursor:wait; }
     .cx-search-filters { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:14px 0 24px; }
+    .cx-search-filters.cx-with-mode { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .cx-search-filters label[hidden] { display:none; }
     .cx-search-filters label { font-size:11px; color:var(--cx-text-dim); display:flex; flex-direction:column; gap:6px; min-width:0; }
     .cx-search-tabs { display:flex; gap:18px; border-bottom:1px solid var(--cx-border); }
     .cx-search-tabs button { font:inherit; font-size:12px; border:0; border-bottom:2px solid transparent; padding:10px 0; background:transparent; color:var(--cx-text-dim); cursor:pointer; }
@@ -2181,7 +2183,7 @@
     .cx-search-meta { color:var(--cx-text-dim); font:11px var(--cx-font-mono); }
     .cx-search-status { padding:24px 4px; color:var(--cx-text-dim); font-size:12px; line-height:1.7; }
     .codex-main button:focus-visible, .codex-main a:focus-visible, .codex-main input:focus-visible, .codex-main select:focus-visible { outline:2px solid var(--cx-blue); outline-offset:2px; }
-    @media (max-width:500px) { .cx-search-filters { grid-template-columns:1fr; } .cx-search-heading kbd { display:none; } }
+    @media (max-width:500px) { .cx-search-filters, .cx-search-filters.cx-with-mode { grid-template-columns:1fr; } .cx-search-heading kbd { display:none; } }
 
     /* 底部聊天抽屉等会破坏观感，隐藏 */
     .${ROOT_CLASS} .chat-drawer-container,
@@ -5066,7 +5068,43 @@
 
   /* ============================== 主区骨架与顶栏 ============================== */
 
-  const searchState = { routeKey: null, query: "", type: "posts", scope: "", id: null, from: "", page: 0, items: [], more: false, loading: false, error: "", retryPage: 1 };
+  // Keep quoted phrases and filter values intact. Only standalone, unquoted
+  // tokens are instructions controlled by the search form.
+  function searchQueryTokens(query) {
+    const tokens = [];
+    let start = -1, quote = "";
+    for (let i = 0; i <= query.length; i++) {
+      const ch = query[i];
+      if (i === query.length || (!quote && /\s/.test(ch))) {
+        if (start >= 0) tokens.push(query.slice(start, i));
+        start = -1;
+        continue;
+      }
+      if (start < 0) start = i;
+      if (ch === "\\" && quote && i + 1 < query.length) { i++; continue; }
+      if (quote) { if (ch === quote) quote = ""; }
+      else if (ch === '"' || (ch === "'" && (i === start || query[i - 1] === ":"))) quote = ch;
+    }
+    return tokens;
+  }
+  function searchModeFromQuery(query) {
+    const tokens = searchQueryTokens(query).map(token => token.toLowerCase());
+    return tokens.includes("in:title") ? "title" : tokens.includes("in:all-posts") ? "all-posts" : "default";
+  }
+  function searchMatchesPosts() {
+    return searchState.scope === "topic" || searchState.mode === "all-posts";
+  }
+  function syncSearchModeControl(form) {
+    const field = form.elements.search_mode;
+    field.value = searchModeFromQuery(form.querySelector(".cx-search-input").value);
+    const route = searchRoute();
+    const visible = route.type === "posts" && route.scope !== "topic";
+    field.disabled = !visible;
+    field.closest("label").hidden = !visible;
+    field.closest(".cx-search-filters").classList.toggle("cx-with-mode", visible);
+  }
+
+  const searchState = { routeKey: null, query: "", type: "posts", mode: "default", scope: "", id: null, from: "", page: 0, items: [], more: false, limitReached: false, loading: false, error: "", retryPage: 1 };
 
   function searchRoute() {
     const params = new URLSearchParams(location.search);
@@ -5091,7 +5129,8 @@
       }
       if (!from) from = scope === "topic" ? `/t/${id}` : `/c/${id}`;
     }
-    return { query: (params.get("q") || "").trim(), type, scope, id: scope ? id : null, from };
+    const query = (params.get("q") || "").trim();
+    return { query, mode:searchModeFromQuery(query), type, scope, id: scope ? id : null, from };
   }
 
   function openScopedSearch(scope) {
@@ -5112,6 +5151,7 @@
         <form class="cx-search-form" role="search">
           <div class="cx-search-field"><input class="cx-search-input" type="search" aria-label="搜索关键词" placeholder="搜索… 支持 in:title、after: 等指令" autocomplete="off"><button class="cx-search-submit" type="submit">搜索</button></div>
           <div class="cx-search-filters">
+            <label>搜索方式<select name="search_mode" aria-label="搜索方式"><option value="default">默认全文</option><option value="title">仅标题</option><option value="all-posts">全部楼层</option></select></label>
             <label>排序<select name="order"><option value="">相关性</option><option value="latest">最新回复</option><option value="latest_topic">最新主题</option><option value="likes">最多点赞</option><option value="views">最多浏览</option></select></label>
             <label>分类<input name="category" placeholder="全部分类" aria-label="分类筛选"></label>
             <label>作者<input name="author" placeholder="所有作者" aria-label="作者筛选"></label>
@@ -5131,9 +5171,9 @@
     for (const [name, token] of [["order", "order"], ["category", "category"], ["author", "user"]]) {
       const field = form.elements[name];
       const value = field.value.trim().replace(/^@/, "");
-      if (!value && !field.dataset.original) continue;
-      query = query.replace(new RegExp(`(?:^|\\s)${token}:(?:"[^"]*"|\\S+)`, "g"), " ").trim();
-      if (value) query += ` ${token}:${/\s/.test(value) ? JSON.stringify(value) : value}`;
+      if (value === (field.dataset.original || "")) continue;
+      query = searchQueryTokens(query).filter(word => !new RegExp("^" + token + ":", "i").test(word)).join(" ");
+      if (value) query += " " + token + ":" + (/\s/.test(value) ? JSON.stringify(value) : value);
     }
     return query.trim();
   }
@@ -5159,6 +5199,17 @@
   function bindSearchEvents(main) {
     const form = main.querySelector(".cx-search-form");
     let composing = false;
+    form.querySelector(".cx-search-input").addEventListener("input", () => syncSearchModeControl(form));
+    form.elements.search_mode.addEventListener("change", () => {
+      const field = form.elements.search_mode;
+      if (field.disabled) return;
+      const input = form.querySelector(".cx-search-input");
+      const tokens = searchQueryTokens(input.value).filter(token => !/^in:(?:title|all-posts)$/i.test(token));
+      if (field.value === "title") tokens.push("in:title");
+      else if (field.value === "all-posts") tokens.push("in:all-posts");
+      input.value = tokens.join(" ");
+      syncSearchModeControl(form);
+    });
     form.addEventListener("compositionstart", () => { composing = true; });
     form.addEventListener("compositionend", () => { composing = false; });
     form.addEventListener("keydown", e => {
@@ -5182,13 +5233,14 @@
     const form = document.querySelector(".cx-search-form");
     const key = pageRequestKey();
     if (searchState.routeKey !== key) {
-      Object.assign(searchState, searchRoute(), { routeKey: key, page: 0, items: [], more: false, error: "", loading: false });
+      Object.assign(searchState, searchRoute(), { routeKey: key, page: 0, items: [], more: false, limitReached: false, error: "", loading: false });
       form.querySelector(".cx-search-input").value = searchState.query;
+      syncSearchModeControl(form);
       for (const [name, token] of [["order", "order"], ["category", "category"], ["author", "user"]]) {
-        const match = new RegExp(`(?:^|\\s)${token}:("[^"]*"|\\S+)`).exec(searchState.query);
-        const value = (match?.[1] || "").replace(/^"|"$/g, "");
+        const word = searchQueryTokens(searchState.query).find(tokenValue => new RegExp("^" + token + ":", "i").test(tokenValue));
+        const value = (word ? word.slice(token.length + 1) : "").replace(/^"|"$/g, "");
         form.elements[name].value = value;
-        form.elements[name].dataset.original = value;
+        form.elements[name].dataset.original = form.elements[name].value;
       }
       document.querySelectorAll("[data-search-type]").forEach(el => {
         const active = el.dataset.searchType === searchState.type;
@@ -5239,7 +5291,7 @@
         throw new Error("搜索响应缺少有效的话题或帖子信息");
       }
       return {
-        id: `post:${postId}`, title, excerpt: searchText(p.blurb),
+        id: searchMatchesPosts() ? "post:" + postId : "topic:" + topicId, title, excerpt: searchText(p.blurb),
         meta: [p.username && `@${p.username}`, `#${postNumber}`, formatTime(p.created_at)].filter(Boolean).join(" · "),
         href: `/t/${encodeURIComponent(t.slug || "topic")}/${topicId}${postNumber > 1 ? `/${postNumber}` : ""}`
       };
@@ -5251,23 +5303,31 @@
     const status = document.querySelector(".cx-search-status");
     if (!box || !status) return;
     box.setAttribute("aria-busy", String(searchState.loading));
-    box.innerHTML = searchState.items.map(item => `<a class="cx-search-result" href="${escapeHtml(item.href)}"><span class="cx-search-result-icon">${ICONS.file}</span><span class="cx-search-result-content"><strong>${escapeHtml(item.title)}</strong><span class="cx-search-excerpt">${escapeHtml(item.excerpt)}</span><span class="cx-search-meta">${escapeHtml(item.meta)}</span></span>${ICONS.chevronRightSm}</a>`).join("");
-    status.innerHTML = searchState.loading ? "搜索中…" : searchState.error
-      ? `${escapeHtml(searchState.error)} <button class="cx-search-retry">重试</button>`
-      : !searchState.query ? "输入关键词开始搜索，可使用站点高级查询指令。"
-      : !searchState.items.length ? "没有匹配结果，试试更简短的关键词或放宽筛选条件。"
-      : searchState.more ? `<button class="cx-search-more">加载更多</button>`
-      : `已显示 ${searchState.items.length} 条结果${searchState.page >= 10 ? " · 请缩小搜索范围以查找更多内容" : ""}`;
-    // Keep a disabled pagination control while a page is pending, including late finally tests.
-    if (searchState.loading && searchState.page) status.innerHTML += `<button class="cx-search-more" disabled>加载中…</button>`;
+    box.innerHTML = searchState.items.map(item =>
+      '<a class="cx-search-result" href="' + escapeHtml(item.href) + '"><span class="cx-search-result-icon">' + ICONS.file +
+      '</span><span class="cx-search-result-content"><strong>' + escapeHtml(item.title) +
+      '</strong><span class="cx-search-excerpt">' + escapeHtml(item.excerpt) +
+      '</span><span class="cx-search-meta">' + escapeHtml(item.meta) + '</span></span>' + ICONS.chevronRightSm + '</a>').join("");
+    const unit = searchState.type !== "posts" ? " 项结果" : searchMatchesPosts() ? " 条匹配帖子" : " 个话题";
+    const count = "已加载 " + searchState.items.length + unit;
+    const prefix = searchState.page ? count + " · " : "";
+    if (searchState.loading) status.textContent = prefix + "搜索中…";
+    else if (searchState.error) status.innerHTML = escapeHtml(prefix + searchState.error) + ' <button class="cx-search-retry">重试</button>';
+    else if (!searchState.query) status.textContent = "输入关键词开始搜索，可使用站点高级查询指令。";
+    else if (searchState.more) status.innerHTML = escapeHtml(count) + ' · <button class="cx-search-more">加载更多</button>';
+    else if (searchState.limitReached) status.textContent = count + " · 已达 10 页上限，请缩小范围";
+    else if (!searchState.items.length) status.textContent = "没有匹配结果，试试更简短的关键词或放宽筛选条件。";
+    else status.textContent = count + " · 当前查询结果已返回完";
+    // Keep pagination disabled while pending; stale finally callbacks cannot release it.
+    if (searchState.loading && searchState.page) status.innerHTML += '<button class="cx-search-more" disabled>加载中…</button>';
   }
 
   async function loadSearchPage(page, force = false) {
     if (!isThemeActive() || !isSearchPath(location.pathname) || !searchState.query || page > 10) return;
     if (searchState.loading && !force) return;
     const owner = pageRequestKey();
-    const { query, type, scope, id } = searchState;
-    const key = JSON.stringify([query, type, scope, id, page]);
+    const { query, type, scope, id, mode } = searchState;
+    const key = JSON.stringify([query, type, scope, id, mode, page]);
     const req = searchCoordinator.begin(key);
     const current = () => req.isCurrent() && isThemeActive() && isSearchPath(location.pathname) && pageRequestKey() === owner;
     searchState.loading = true;
@@ -5276,8 +5336,9 @@
     renderSearchResults();
     try {
       const context = scope ? `&search_context%5Btype%5D=${scope}&search_context%5Bid%5D=${id}` : "";
-      const postsQuery = /(?:^|\s)in:all-posts(?=\s|$)/i.test(query) ? query : `${query} in:all-posts`;
-      const endpoint = type === "posts" ? `/search.json?q=${encodeURIComponent(postsQuery)}&page=${page}${context}` : `/search/query?term=${encodeURIComponent(query)}${type === "users" ? "&type_filter=user" : ""}`;
+      // Native search aggregates topics unless q explicitly requests all matching posts.
+      const endpoint = type === "posts" ? "/search.json?q=" + encodeURIComponent(query) + "&page=" + page + context
+        : "/search/query?term=" + encodeURIComponent(query) + (type === "users" ? "&type_filter=user" : "");
       const data = await api(endpoint, undefined, req.signal);
       if (!current()) return;
       const error = data.errors?.join?.(" · ") || data.error || data.grouped_search_result?.error;
@@ -5285,9 +5346,14 @@
       const items = searchItems(data, type);
       const previous = page === 1 ? [] : searchState.items;
       const seen = new Set(previous.map(item => item.id));
-      searchState.items = previous.concat(items.filter(item => !seen.has(item.id)));
+      searchState.items = previous.concat(items.filter(item => {
+        if (seen.has(item.id)) return false;
+        seen.add(item.id);
+        return true;
+      }));
       searchState.page = page;
-      searchState.more = type === "posts" && page < 10 && !!data.more_full_page_results;
+      searchState.more = type === "posts" && page < 10 && data.more_full_page_results === true;
+      searchState.limitReached = type === "posts" && page === 10 && data.more_full_page_results === true;
       searchCoordinator.succeed(req.requestId, key);
     } catch (err) {
       if (!current() || err.name === "AbortError") return;
